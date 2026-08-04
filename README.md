@@ -40,9 +40,10 @@ answered them you can walk away.
 
 | step | what | default |
 |---|---|---|
+| `hostname` | set the system hostname (+ `/etc/hosts`) | asks, defaults to current |
 | `lvm` | grow the root LV into unallocated VG space | asks, **no** |
 | `apt` | update + upgrade | asks if anything is upgradable, **yes** |
-| `packages` | 19 system packages | always |
+| `packages` | 25 system packages | always |
 | `tailscale` | its own apt repo, then `tailscale up` | always; login asks |
 | `mosh` | install + ensure a UTF-8 locale exists | always |
 | `nvidia` | driver + nvtop, then hold against apt | asks |
@@ -57,6 +58,7 @@ silently doing nothing.
 
 | flag | purpose |
 |---|---|
+| `--hostname NAME` | set the hostname; skips the prompt |
 | `--check` | dry run, change nothing |
 | `--only a,b` | run just these steps |
 | `--reinstall` | answer yes to every already-present component |
@@ -76,7 +78,9 @@ old kernel module stays resident — `Failed to initialize NVML: Driver/library
 version mismatch` — and any running inference container loses its GPUs, at
 whatever hour that happened.
 
-So the step holds **all 18** nvidia packages. Held packages are visible, not
+So the step holds every nvidia package version-tied to the driver branch —
+`nvidia-prime`, `nvidia-settings` and `libnvidia-egl-wayland1` are excluded, as
+they are independent Ubuntu packages whose security updates should keep flowing. Held packages are visible, not
 hidden: `apt upgrade` prints "kept back" and `apt-mark showhold` lists them.
 
 This costs nothing, because **the GPU software that actually churns is not on
@@ -127,12 +131,14 @@ Installed from **Docker's own apt repo**, not Ubuntu's `docker.io`. The
 generated `/etc/docker/daemon.json` sets two things beyond the nvidia runtime:
 
 ```json
+"log-opts": { "max-size": "100m", "max-file": "5" },
 "default-shm-size": "16G",
 "default-ulimits": { "memlock": { "Hard": -1, "Soft": -1 } }
 ```
 
-Multi-GPU NCCL hangs or dies with cryptic OOMs when those are left at docker's
-defaults. Setting them daemon-side means you cannot forget the flags.
+Multi-GPU NCCL hangs or dies with cryptic OOMs when shm/memlock are left at
+docker's defaults, and the default `json-file` log driver is **unbounded** — a
+long-running vLLM container writing progress lines will otherwise fill `/`. Setting them daemon-side means you cannot forget the flags.
 
 `--ipc=host` and the CUDA compat tmpfs mount stay per-container; see the
 rtx6kpro wiki for those.

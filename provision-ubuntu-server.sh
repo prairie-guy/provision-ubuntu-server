@@ -38,6 +38,7 @@ GROW_MIN_BYTES=$((1024*1024*1024))              # below this, not worth resizing
 # to sudo, which a non-sudo account cannot do.
 SYSTEM_PACKAGES=(
   git curl wget bc less        # account script
+  openssh-client               # account script: ssh-keygen + the ssh git clone
   ca-certificates gnupg        # required by add_apt_repo below
   emacs-nox                    # doom's setup.sh installs this itself; without
                                # it the FIRST account run escalates to sudo
@@ -53,6 +54,12 @@ SYSTEM_PACKAGES=(
   pv                           # progress on multi-GB copies
   p7zip-full                   # 7z, which tar and unzip cannot read
 )
+
+# --- identity ---------------------------------------------------------------
+# Prompted for, defaulting to the current hostname. Set BEFORE the tailscale
+# step: tailscale takes its device name from the hostname at registration, so
+# renaming afterwards means the tailnet keeps showing the old name.
+SYSTEM_HOSTNAME="${SYSTEM_HOSTNAME:-}"          # --hostname
 
 # --- gpu --------------------------------------------------------------------
 # `ubuntu-drivers devices` reports this as `recommended` for these exact cards,
@@ -207,7 +214,10 @@ add_apt_repo() {
 
 # One apt-get update per run, and only when it can matter.
 apt_update() {
-  (( APT_UPDATED )) && return 0
+  # APT_STALE must be tested FIRST: a repo added later in the run needs indexing
+  # even though an update already happened, or `apt install docker-ce` fails
+  # with "Unable to locate package".
+  (( APT_UPDATED )) && (( ! APT_STALE )) && return 0
   if (( ! APT_STALE )) \
      && [[ -n "$(find /var/lib/apt/lists -maxdepth 1 -name '*Packages*' -newermt '-1 hour' -print -quit 2>/dev/null)" ]]; then
     skip "apt lists are less than an hour old"
@@ -246,12 +256,16 @@ while (( $# )); do
     --docker)      DO_DOCKER=1; shift ;;
     --nvctk)       DO_NVCTK=1; DO_DOCKER=1; shift ;;
     --reboot)      DO_REBOOT=1; shift ;;
+    --hostname)    SYSTEM_HOSTNAME="${2:?--hostname needs a name}"; HOSTNAME_EXPLICIT=1; shift 2 ;;
+    --hostname=*)  SYSTEM_HOSTNAME="${1#*=}"; HOSTNAME_EXPLICIT=1; shift ;;
     --gpu-cap)     GPU_POWER_CAP="${2:?--gpu-cap needs a wattage}"; shift 2 ;;
     --gpu-cap=*)   GPU_POWER_CAP="${1#*=}"; shift ;;
     --data-root)   DOCKER_DATA_ROOT="${2:?--data-root needs a path}"; shift 2 ;;
     --data-root=*) DOCKER_DATA_ROOT="${1#*=}"; shift ;;
     --docker-user) DOCKER_GROUP_USER="${2:?--docker-user needs a name}"; shift 2 ;;
+    --docker-user=*) DOCKER_GROUP_USER="${1#*=}"; shift ;;
     --grow-pct)    GROW_ROOT_LV_PCT="${2:?--grow-pct needs a number}"; shift 2 ;;
+    --grow-pct=*)  GROW_ROOT_LV_PCT="${1#*=}"; shift ;;
     --only)        ONLY="${2:?--only needs a comma-separated step list}"; shift 2 ;;
     --only=*)      ONLY="${1#*=}"; shift ;;
     -h|--help)     sed -n '2,17p' "$0" | sed 's/^# \?//'; exit 0 ;;
@@ -261,7 +275,7 @@ done
 
 # A step runs unless --only was given and does not name it. Unknown names are
 # rejected: a typo would otherwise run nothing and exit 0, looking successful.
-VALID_STEPS=(lvm apt packages tailscale mosh nvidia docker nvctk gpustate)
+VALID_STEPS=(hostname lvm apt packages tailscale mosh nvidia docker nvctk gpustate)
 if [[ -n "$ONLY" ]]; then
   IFS=, read -r -a _requested <<<"$ONLY"
   for _s in "${_requested[@]}"; do
@@ -270,6 +284,17 @@ if [[ -n "$ONLY" ]]; then
   done
 fi
 want() { [[ -z "$ONLY" ]] || [[ ",$ONLY," == *",$1,"* ]]; }
+
+# Default to the current name so pressing Enter keeps it.
+[[ -n "${HOSTNAME_EXPLICIT:-}" ]] || HOSTNAME_EXPLICIT=0
+[[ -n "$SYSTEM_HOSTNAME" ]] || SYSTEM_HOSTNAME="$(hostname)"
+
+# GPU_POWER_CAP lands in a sed replacement and in an ExecStart line; a stray | or
+# a non-numeric value would corrupt the unit or fail at every boot.
+[[ -z "$GPU_POWER_CAP" || "$GPU_POWER_CAP" =~ ^[0-9]+$ ]] \
+  || die "invalid --gpu-cap '$GPU_POWER_CAP': watts must be a whole number"
+[[ "$GROW_ROOT_LV_PCT" =~ ^[0-9]+$ ]] && (( GROW_ROOT_LV_PCT >= 1 && GROW_ROOT_LV_PCT <= 100 )) \
+  || die "invalid --grow-pct '$GROW_ROOT_LV_PCT': use 1-100"
 
 [[ "$(uname -s)" == "Linux" ]] || die "this script targets Linux"
 command -v apt-get >/dev/null || die "apt-get not found; this script targets Ubuntu/Debian"
@@ -281,7 +306,9 @@ command -v apt-get >/dev/null || die "apt-get not found; this script targets Ubu
 # invoked by the human rather than `sudo bash` -- so it calls sudo itself.
 if [[ $EUID -eq 0 ]]; then
   SUDO=""
-  [[ -n "${SUDO_USER:-}" || -n "$DOCKER_GROUP_USER" ]] \
+  # Without SUDO_USER, DOCKER_GROUP_USER defaulted to `root`, and adding root to
+  # the docker group is meaningless. Require an explicit target instead.
+  [[ "$DOCKER_GROUP_USER" != root ]] \
     || die "running as root with no SUDO_USER: pass --docker-user NAME so the
    docker group addition has a target other than root"
 else
@@ -352,7 +379,10 @@ lvm_probe() {
   command -v lvs >/dev/null || { LVM_WHY="lvm2 is not installed"; return 1; }
   src="$(findmnt -no SOURCE /)"  || { LVM_WHY="cannot identify the device behind /"; return 1; }
   LVM_FSTYPE="$(findmnt -no FSTYPE /)"
-  $SUDO -n true 2>/dev/null || { LVM_WHY="need root to read LVM state"; return 1; }
+  # As root SUDO is empty, and `$SUDO -n true` would expand to `-n true`.
+  if [[ -n "$SUDO" ]]; then
+    sudo -n true 2>/dev/null || { LVM_WHY="need root to read LVM state"; return 1; }
+  fi
 
   # lvs accepts a device path and fails cleanly on anything that is not an LV,
   # which also rejects a bare partition, mdraid, or a LUKS mapper node above it.
@@ -394,6 +424,14 @@ lvm_probe() {
 # when absent, "update X?" when present. Asked here, before any work, so a long
 # run never stops for input. A flag already given is taken as the answer.
 # --reinstall answers yes to every component that is present.
+
+if want hostname && (( ! HOSTNAME_EXPLICIT )) && [[ -t 0 ]]; then
+  read -r -p "hostname [$SYSTEM_HOSTNAME]: " _reply || true
+  [[ -n "${_reply:-}" ]] && SYSTEM_HOSTNAME="$_reply"
+fi
+# RFC 1123: it lands in /etc/hosts and is what tailscale registers.
+[[ "$SYSTEM_HOSTNAME" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] \
+  || die "invalid hostname '$SYSTEM_HOSTNAME': letters, digits and hyphens only, no leading or trailing hyphen"
 
 DO_GROW_LV=0
 FORCE_DOCKER=$FORCE; FORCE_NVCTK=$FORCE; FORCE_GPUSTATE=$FORCE
@@ -482,7 +520,28 @@ defer() { DEFERRED+=("$1"); warn "deferred until after the reboot: $1"; }
 CODENAME="$(. /etc/os-release && printf '%s' "${UBUNTU_CODENAME:-$VERSION_CODENAME}")"
 ARCH="$(dpkg --print-architecture)"
 
-# ------------------------------------------------------------------- 1. lvm --
+# -------------------------------------------------------------- 1. hostname --
+
+if want hostname; then
+  _cur="$(hostname)"
+  if [[ "$SYSTEM_HOSTNAME" == "$_cur" ]]; then
+    skip "hostname is already $_cur"
+  else
+    log "setting hostname: $_cur -> $SYSTEM_HOSTNAME"
+    run $SUDO hostnamectl set-hostname "$SYSTEM_HOSTNAME"
+    # hostnamectl alone leaves /etc/hosts stale, and then every sudo call
+    # prints "unable to resolve host <old>" until the next reboot.
+    if grep -qE "^127\.0\.1\.1[[:space:]]" /etc/hosts; then
+      run $SUDO sed -i "s/^127\.0\.1\.1[[:space:]].*/127.0.1.1\t$SYSTEM_HOSTNAME/" /etc/hosts
+    else
+      (( CHECK_ONLY )) && printf '    \033[2m[would append]\033[0m 127.0.1.1 %s to /etc/hosts\n' "$SYSTEM_HOSTNAME" \
+        || printf '127.0.1.1\t%s\n' "$SYSTEM_HOSTNAME" | $SUDO tee -a /etc/hosts >/dev/null
+    fi
+    HOSTNAME_CHANGED=1
+  fi
+fi
+
+# ------------------------------------------------------------------- 2. lvm --
 
 if want lvm; then
   if (( ! LVM_OK )); then
@@ -577,22 +636,39 @@ if want nvidia; then
     if have_pkg "$NVIDIA_DRIVER_PKG" && ! gpu_ready; then
       warn "$NVIDIA_DRIVER_PKG $(nvidia_pkg_version) is installed but $(nvidia_running_version 2>/dev/null || echo 'no module') is loaded -- a reboot is needed"
     fi
-    # A deliberate driver change means unholding first.
-    if apt-mark showhold 2>/dev/null | grep -q '^nvidia-'; then
+    # A deliberate driver change means unholding first. Remember that we did,
+    # so the holds are restored below -- otherwise this path silently leaves the
+    # box in exactly the state the hold exists to prevent.
+    if apt-mark showhold 2>/dev/null | grep -qE '^(nvidia-|libnvidia-)'; then
       log "unholding nvidia packages for a deliberate change"
       run $SUDO apt-mark unhold $(apt-mark showhold | grep -E '^(nvidia-|libnvidia-)')
+      WAS_HELD=1
     fi
-    apt_install "$NVIDIA_DRIVER_PKG" "${NVIDIA_EXTRA_PKGS[@]}"
+    # apt_install only installs what is MISSING, so it cannot upgrade. A
+    # deliberate reinstall/update has to say so explicitly.
+    if (( FORCE_NVIDIA )) && have_pkg "$NVIDIA_DRIVER_PKG"; then
+      apt_update
+      log "upgrading $NVIDIA_DRIVER_PKG ${NVIDIA_EXTRA_PKGS[*]}"
+      run $SUDO env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l \
+          apt-get install -y --only-upgrade -o Dpkg::Options::=--force-confold \
+          "$NVIDIA_DRIVER_PKG" "${NVIDIA_EXTRA_PKGS[@]}"
+    else
+      apt_install "$NVIDIA_DRIVER_PKG" "${NVIDIA_EXTRA_PKGS[@]}"
+    fi
     if (( ! CHECK_ONLY )) && ! nvidia_dkms_ok; then
       warn "dkms has NOT built the nvidia module for $(uname -r)."
       warn "Check before rebooting:  dkms status; cat /var/lib/dkms/nvidia/*/build/make.log"
     fi
   fi
 
-  if (( DO_HOLD_NVIDIA )); then
+  if (( DO_HOLD_NVIDIA )) || [[ -n "${WAS_HELD:-}" ]]; then
     # The metapackage's deps are unversioned, so holding it alone still lets
     # libnvidia-* move underneath and desync from the loaded module.
-    mapfile -t _held < <(dpkg -l | awk '/^ii +(nvidia-|libnvidia-)/{print $2}')
+    # Only packages version-tied to the driver branch. nvidia-prime,
+    # nvidia-settings and libnvidia-egl-wayland1 are independent Ubuntu
+    # packages -- holding them blocks their security updates for no benefit.
+    mapfile -t _held < <(dpkg -l | awk '/^ii +(nvidia-|libnvidia-)/{print $2}' \
+                         | grep -vE '^(nvidia-prime|nvidia-settings|libnvidia-egl-wayland1)')
     if (( ${#_held[@]} )); then
       log "holding ${#_held[@]} nvidia packages against apt upgrade"
       run $SUDO apt-mark hold "${_held[@]}"
@@ -626,10 +702,10 @@ if want docker && (( DO_DOCKER )); then
   # Detect, do not migrate: an interrupted copy, or one that loses hardlinks or
   # xattrs, corrupts the overlay2 store silently.
   SKIP_DAEMON_JSON=0
-  _current_root="$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || true)"
+  _current_root="$($SUDO docker info -f '{{.DockerRootDir}}' 2>/dev/null || true)"
   if [[ -n "$DOCKER_DATA_ROOT" && -n "$_current_root" \
         && "$_current_root" != "$DOCKER_DATA_ROOT" \
-        && -n "$(docker image ls -q 2>/dev/null)" ]]; then
+        && -n "$($SUDO docker image ls -q 2>/dev/null)" ]]; then
     warn "docker runs with data-root=$_current_root and already holds images."
     warn "This script will NOT move them. Do it deliberately:"
     warn "    sudo systemctl stop docker docker.socket   # the SOCKET too"
@@ -647,6 +723,8 @@ if want docker && (( DO_DOCKER )); then
       if (( DO_NVCTK )) || have_nvctk; then
         printf '  "runtimes": {\n    "nvidia": {\n      "args": [],\n      "path": "nvidia-container-runtime"\n    }\n  },\n'
       fi
+      printf '  "log-driver": "json-file",\n'
+      printf '  "log-opts": { "max-size": "100m", "max-file": "5" },\n'
       printf '  "default-shm-size": "%s",\n' "$DOCKER_SHM_SIZE"
       printf '  "default-ulimits": {\n    "memlock": { "Name": "memlock", "Hard": -1, "Soft": -1 }\n  }'
       [[ -n "$DOCKER_DATA_ROOT" ]] && printf ',\n  "data-root": "%s"' "$DOCKER_DATA_ROOT"
@@ -666,7 +744,7 @@ if want docker && (( DO_DOCKER )); then
   run $SUDO systemctl enable --now docker
 
   if [[ -n "${DOCKER_NEEDS_RESTART:-}" ]]; then
-    if [[ -n "$(docker ps -q 2>/dev/null)" ]]; then
+    if [[ -n "$($SUDO docker ps -q 2>/dev/null)" ]]; then
       warn "daemon.json changed but containers are running -- not restarting docker."
       warn "Restart it yourself when convenient:  sudo systemctl restart docker"
     else
@@ -697,7 +775,9 @@ if want nvctk && (( DO_NVCTK )); then
 
   # Packages install fine without a driver; only the verification needs one.
   if gpu_ready; then
-    if (( CHECK_ONLY )) || $SUDO nvidia-container-cli info >/dev/null 2>&1; then
+    if (( CHECK_ONLY )); then
+      skip "would verify: nvidia-container-cli info"
+    elif $SUDO nvidia-container-cli info >/dev/null 2>&1; then
       log "nvidia-container-cli sees the GPUs"
     else
       warn "nvidia-container-cli cannot see the GPUs; containers will not get them"
