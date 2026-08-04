@@ -53,6 +53,7 @@ SYSTEM_PACKAGES=(
   build-essential              # doom: compiles vterm + tree-sitter grammars
   libvterm-dev pkg-config      # doom: :term vterm needs all four of these
   cmake libtool-bin
+  uidmap                       # rootless docker: newuidmap/newgidmap
   unzip zip                    # archives -- nothing else provides these
   rsync                        # this script's own data-root advice uses it
   pigz                         # parallel gzip; gzip uses 1 of 48 cores here
@@ -65,6 +66,12 @@ SYSTEM_PACKAGES=(
 # step: tailscale takes its device name from the hostname at registration, so
 # renaming afterwards means the tailnet keeps showing the old name.
 SYSTEM_HOSTNAME="${SYSTEM_HOSTNAME:-}"          # --hostname
+
+# Accounts that run GPU containers via ROOTLESS docker. A rootless daemon runs
+# as the account and so cannot raise the account's own memlock hard limit --
+# it has to be raised here, at the system level, or CUDA pinned-memory and NCCL
+# allocations fail inside its containers. Empty = install nothing.
+MEMLOCK_ACCOUNTS="${MEMLOCK_ACCOUNTS:-}"        # --memlock-accounts "a b"
 
 # --- gpu --------------------------------------------------------------------
 # `ubuntu-drivers devices` reports this as `recommended` for these exact cards,
@@ -273,6 +280,8 @@ while (( $# )); do
     --reboot)      DO_REBOOT=1; shift ;;
     --hostname)    SYSTEM_HOSTNAME="${2:?--hostname needs a name}"; HOSTNAME_EXPLICIT=1; shift 2 ;;
     --hostname=*)  SYSTEM_HOSTNAME="${1#*=}"; HOSTNAME_EXPLICIT=1; shift ;;
+    --memlock-accounts)   MEMLOCK_ACCOUNTS="${2:?--memlock-accounts needs a name or space-separated list}"; shift 2 ;;
+    --memlock-accounts=*) MEMLOCK_ACCOUNTS="${1#*=}"; shift ;;
     --gpu-cap)     GPU_POWER_CAP="${2:?--gpu-cap needs a wattage}"; shift 2 ;;
     --gpu-cap=*)   GPU_POWER_CAP="${1#*=}"; shift ;;
     --data-root)   DOCKER_DATA_ROOT="${2:?--data-root needs a path}"; shift 2 ;;
@@ -290,7 +299,7 @@ done
 
 # A step runs unless --only was given and does not name it. Unknown names are
 # rejected: a typo would otherwise run nothing and exit 0, looking successful.
-VALID_STEPS=(hostname lvm apt packages tailscale mosh nvidia docker nvctk gpustate)
+VALID_STEPS=(hostname limits lvm apt packages tailscale mosh nvidia docker nvctk gpustate)
 if [[ -n "$ONLY" ]]; then
   IFS=, read -r -a _requested <<<"$ONLY"
   for _s in "${_requested[@]}"; do
@@ -559,7 +568,27 @@ if want hostname; then
   fi
 fi
 
-# ------------------------------------------------------------------- 2. lvm --
+# --------------------------------------------------------------- 2. limits --
+
+if want limits && [[ -n "$MEMLOCK_ACCOUNTS" ]]; then
+  _lim="$TMPD/limits-memlock.conf"
+  cp "$TEMPLATES/limits-memlock.conf" "$_lim"
+  for _a in $MEMLOCK_ACCOUNTS; do
+    getent passwd "$_a" >/dev/null || die "no such account: $_a"
+    printf '%s soft memlock unlimited\n%s hard memlock unlimited\n' "$_a" "$_a" >>"$_lim"
+  done
+  if cmp -s "$_lim" /etc/security/limits.d/90-memlock.conf; then
+    skip "memlock limits already current for: $MEMLOCK_ACCOUNTS"
+  else
+    backup /etc/security/limits.d/90-memlock.conf
+    log "raising memlock for: $MEMLOCK_ACCOUNTS (applies at their next login)"
+    run $SUDO install -D -m 0644 -o root -g root "$_lim" /etc/security/limits.d/90-memlock.conf
+  fi
+elif want limits; then
+  skip "no --memlock-accounts given; not touching /etc/security/limits.d"
+fi
+
+# ------------------------------------------------------------------- 3. lvm --
 
 if want lvm; then
   if (( ! LVM_OK )); then
