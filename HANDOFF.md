@@ -65,6 +65,35 @@ community wiki validated**. Move only when a container needs CUDA above 13.2.
 `scratch` exists for an **agent** to drive. It must not have root. The naive
 setup — adding it to the `docker` group — silently grants exactly that.
 
+### Default access: none
+
+**Docker is root-only out of the box.** The socket is:
+
+```
+/var/run/docker.sock   srw-rw----  root:docker
+```
+
+so only root and members of the `docker` group can reach the system daemon.
+A newly created account gets:
+
+```
+permission denied while trying to connect to the docker API at unix:///var/run/docker.sock
+```
+
+There is no "all accounts can use docker" state, and no way to reach that
+safely — group membership is the only switch, and it is all-or-nothing root.
+Installing Docker grants nothing to anyone; access is a separate, deliberate
+per-account decision, and there are exactly two options:
+
+| option | grants | suitable for |
+|---|---|---|
+| `usermod -aG docker NAME` | **root-equivalent** | a human admin |
+| rootless daemon, per account | containers only, as that account | an agent, or any untrusted worker |
+
+**Rootless is per-account and not automatic.** Each account that needs
+containers runs its own setup and gets its own daemon, socket, and image store.
+Provisioning one account grants nothing to the next.
+
 ### The problem
 
 Membership in the `docker` group is **root-equivalent**. The docker socket is
@@ -92,13 +121,16 @@ copper's `scratch` is uid 1000, the installer-created admin account with full
 run as `scratch`, so bind-mounting `/` shows only what `scratch` could already
 see. No escalation path.
 
-```bash
-# ── as cdaniels (admin) ──────────────────────────────────────
-sudo apt install -y uidmap          # provides newuidmap/newgidmap
-sudo gpasswd -d scratch docker      # REVOKE the root-equivalent group
-sudo loginctl enable-linger scratch # daemon survives logout
+**Three commands need root; the rest do not.** Nothing in the second block
+requires sudo — that is the point.
 
-# ── as scratch ───────────────────────────────────────────────
+```bash
+# ══ REQUIRES ROOT — run as an admin account (cdaniels) ═══════
+sudo apt install -y uidmap          # newuidmap/newgidmap; rootless cannot work without it
+sudo gpasswd -d scratch docker      # REVOKE the root-equivalent group, if present
+sudo loginctl enable-linger scratch # let the account's daemon outlive its sessions
+
+# ══ NO ROOT — run as the account itself (scratch) ════════════
 dockerd-rootless-setuptool.sh install
 
 mkdir -p ~/.config/nvidia-container-runtime
