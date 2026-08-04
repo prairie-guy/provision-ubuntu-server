@@ -252,6 +252,16 @@ apt_install() {
   return 0
 }
 
+# apt_install only installs what is MISSING, so it can never upgrade. A
+# deliberate "update it?" answer has to say so explicitly.
+apt_upgrade_pkgs() {
+  apt_update
+  log "upgrading: $*"
+  run $SUDO env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l \
+      apt-get install -y --only-upgrade -o Dpkg::Options::=--force-confold "$@"
+  return 0
+}
+
 # ------------------------------------------------------------------- args --
 
 while (( $# )); do
@@ -655,11 +665,7 @@ if want nvidia; then
     # apt_install only installs what is MISSING, so it cannot upgrade. A
     # deliberate reinstall/update has to say so explicitly.
     if (( FORCE_NVIDIA )) && have_pkg "$NVIDIA_DRIVER_PKG"; then
-      apt_update
-      log "upgrading $NVIDIA_DRIVER_PKG ${NVIDIA_EXTRA_PKGS[*]}"
-      run $SUDO env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l \
-          apt-get install -y --only-upgrade -o Dpkg::Options::=--force-confold \
-          "$NVIDIA_DRIVER_PKG" "${NVIDIA_EXTRA_PKGS[@]}"
+      apt_upgrade_pkgs "$NVIDIA_DRIVER_PKG" "${NVIDIA_EXTRA_PKGS[@]}"
     else
       apt_install "$NVIDIA_DRIVER_PKG" "${NVIDIA_EXTRA_PKGS[@]}"
     fi
@@ -692,7 +698,11 @@ if want docker && (( DO_DOCKER )); then
   add_apt_repo docker \
     "https://download.docker.com/linux/ubuntu/gpg" \
     "deb [arch=${ARCH} signed-by=@KEYRING@] https://download.docker.com/linux/ubuntu ${CODENAME} stable"
-  apt_install "${DOCKER_PACKAGES[@]}"
+  if (( FORCE_DOCKER )); then
+    apt_upgrade_pkgs "${DOCKER_PACKAGES[@]}"
+  else
+    apt_install "${DOCKER_PACKAGES[@]}"
+  fi
 
   # Refuse to plant a root-owned image store inside somebody's home directory:
   # `deluser --remove-home` would then take every image with it.
@@ -779,7 +789,11 @@ if want nvctk && (( DO_NVCTK )); then
   add_apt_repo nvidia-container-toolkit \
     "https://nvidia.github.io/libnvidia-container/gpgkey" \
     'deb [signed-by=@KEYRING@] https://nvidia.github.io/libnvidia-container/stable/deb/$(ARCH) /'
-  apt_install "${NVCTK_PACKAGES[@]}"
+  if (( FORCE_NVCTK )); then
+    apt_upgrade_pkgs "${NVCTK_PACKAGES[@]}"
+  else
+    apt_install "${NVCTK_PACKAGES[@]}"
+  fi
 
   # Packages install fine without a driver; only the verification needs one.
   if gpu_ready; then
@@ -861,7 +875,11 @@ if have_docker; then
   echo
   log "docker: $(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo '/var/lib/docker'), $(df -h --output=avail "$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)" 2>/dev/null | tail -1 | tr -d ' ') free"
   log "test it:      docker run --rm hello-world"
-  have_nvctk && log "test the GPUs: docker run --rm --gpus all nvidia/cuda:13.0.0-base-ubuntu24.04 nvidia-smi"
+  # Docker 29 routes --gpus through CDI and treats it as vendor-agnostic, so
+  # `--gpus all` fails with "AMD CDI spec not found". The explicit CDI device
+  # form works on every version that has a spec, so print that instead.
+  have_nvctk && log "test the GPUs: docker run --rm --device nvidia.com/gpu=all nvidia/cuda:13.0.0-base-ubuntu24.04 nvidia-smi"
+  have_nvctk && warn "note: '--gpus all' fails on docker 29.x -- use --device nvidia.com/gpu=all"
   echo
   warn "docker publishes ports BELOW any firewall: '-p 8000:8000' is reachable"
   warn "from your whole LAN. Bind explicitly instead:"

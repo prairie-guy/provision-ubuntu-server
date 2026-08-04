@@ -157,6 +157,22 @@ Changing it after images exist is **detected and refused**, not migrated — an
 interrupted copy, or one that loses hardlinks or xattrs, corrupts the overlay2
 store silently. The script prints the correct `rsync -aHAX` recipe instead.
 
+### `--gpus all` is broken on Docker 29.x
+
+Docker 29 routes `--gpus` through CDI and treats it as vendor-agnostic, so
+`--gpus all` fails with `AMD CDI spec not found` even when the NVIDIA spec is
+present and correct. Use the explicit device form:
+
+```
+docker run --rm --device nvidia.com/gpu=all nvidia/cuda:13.0.0-base-ubuntu24.04 nvidia-smi
+docker run --rm --device nvidia.com/gpu=0 --device nvidia.com/gpu=1 ...   # specific cards
+```
+
+This works on every Docker version that has a CDI spec, so it is the portable
+form. `nvidia-container-toolkit` generates the spec into `/var/run/cdi/` and
+ships `nvidia-cdi-refresh.path` to regenerate it at boot and on driver change —
+nothing for this script to do.
+
 ### Docker publishes below any firewall
 
 `-p 8000:8000` is reachable from your whole LAN regardless of ufw, because
