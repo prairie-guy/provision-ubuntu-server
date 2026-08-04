@@ -319,3 +319,124 @@ relocated its image store was fixed in `51df894`.
 
 **Any copper runbook that calls `sudo` will fail as `scratch@gold`.** Same
 username, different privilege.
+
+---
+
+## 5. provision-ubuntu-account — status
+
+Repo: `prairie-guy/provision-ubuntu-account` (`main`). Fourteen steps:
+
+```
+dirs  bashrc  loginshell  git  dotfiles  ssh  apt  mamba  node  ml
+emacs  dockerrootless  claude  codex
+```
+
+Run on gold for both `cdaniels` and `scratch`. Needs **no sudo** once the
+server script has run — that is the contract between them, and it is what lets a
+non-sudo agent account provision itself completely.
+
+Notable behaviour:
+
+* **Every component is asked about individually**, phrased by actual state —
+  "install X?" when absent, "update X?" when present. A blanket question could
+  not distinguish updating mamba packages from reinstalling Codex.
+* **File steps only ask when a file has actually drifted** from its template, so
+  a steady-state re-run is question-free. Those default to *yes* (replacing
+  drift is the point); component installs default to *no*.
+* **`--reinstall`** answers yes to every already-present component.
+* The **ssh key is never regenerated**, even by `--reinstall` — that would
+  invalidate every host it is registered with.
+
+`templates/` carries `bashrc`, `dirs-README.md`, `git-ignore`,
+`zellij-config.kdl`, `claude-settings.json`, `docker-daemon.json`, `bin/gpu-power`.
+
+---
+
+## 6. Conventions both scripts share
+
+Preserve these when refining; they are load-bearing, not stylistic.
+
+* `set -euo pipefail`, one `trap cleanup EXIT` (a second silently replaces the
+  first — this was a real bug once).
+* **All questions before any work.** A long run must never stop for input.
+  sudo is primed up front and kept warm for the same reason.
+* **`run` wrapper** for every mutation, so `--check` is honest. Anything that
+  cannot go through it gets an explicit `if (( CHECK_ONLY ))` branch.
+* **Idempotency by probing the real system**, never a state file. A stamp file
+  becomes a second source of truth that goes stale the moment someone runs `apt`
+  by hand. This is what makes a second run after a reboot finish what the first
+  deferred.
+* **Content-compare before writing** (`cmp -s`), back up before overwriting.
+* `dpkg-query` for package presence; `apt_install` only *adds* — deliberate
+  upgrades go through `apt_upgrade_pkgs` with `--only-upgrade`.
+* **`safe_rmdir`** for any removal: hard-refuses `/`, `$HOME`, the script's own
+  directory and its ancestors, then prints what it is about to delete and
+  requires the word `DELETE`.
+* Unknown `--only` steps and unknown flags are **rejected**, never ignored.
+
+---
+
+## 7. Testing changes
+
+* `bash -n` first; `systemd-analyze verify` for unit templates.
+* `./script --check` on this box, then `--check` per `--only` step.
+* **Against a fresh `$HOME`**: `HOME=/tmp/fake ./provision-ubuntu-account.sh --check`
+  exercises the install branches that a provisioned box always skips.
+* **Non-tty**: `... </dev/null` must never block and must take every default.
+* **LVM without a wipe**: build a loopback rig — `truncate -s 20G`, `losetup -fP`,
+  `vgcreate`, a deliberately small `lvcreate` — and point the probe at it. That
+  also lets you test the refusal paths (thin pool, snapshot, LUKS) which a real
+  install cannot easily produce.
+* Remember: **`--check` and read-only audits missed real bugs** here. `--gpus all`
+  in the summary, and write-only `FORCE_DOCKER`, were both found only by running
+  it for real.
+
+---
+
+## 8. Known findings NOT addressed
+
+From a read-only audit, judged lower priority at the time. None are fixed.
+
+* **`iommu=pt` is not on the kernel cmdline.** On AMD platforms NVIDIA suggests
+  it to keep the IOMMU out of the DMA/P2P path. All four GPUs are `NODE` with
+  P2P `OK`, single NUMA node. **Measure NCCL all-reduce before touching GRUB** —
+  the benefit on this board is unverified.
+* **Nothing verifies dkms after an unattended kernel upgrade.** `unattended-upgrades`
+  is on with automatic reboot off. A security kernel lands, dkms rebuilds
+  silently, and a *failed* rebuild is invisible until the next reboot takes all
+  four GPUs down. A `dkms status` check unit would close this.
+* **`gpu-state.service` has no hardware condition.** On a box with no NVIDIA card
+  its `until nvidia-smi -L` loop blocks 90 s at every boot then fails.
+  `ConditionPathExistsGlob=/dev/nvidia[0-9]*` would make it inert.
+* **Host memlock is the account default, not unlimited.** The `limits` step exists
+  but was never needed (see the §3 correction). Only matters for rootless.
+* **`--check` cannot read LVM state without cached sudo**, so it reports
+  "need root" rather than the real decision. Cosmetic but misleading.
+* **`_archive/*/model.sh` still contain `--gpus all`.** Deliberate — archived.
+
+---
+
+## 9. local-models — design decision pending
+
+GPU allocation is currently **hand-edited in `model.sh`**, which will not survive
+a `git pull` from copper. The discussed fix, not yet implemented:
+
+```json
+{ "id": "...", "gpus": [0, 1], "gpu_memory_utilization": 0.85 }
+```
+
+`model.sh` then derives both flags from that array:
+
+```bash
+GPUS=$(python3 -c "import json;print(' '.join(str(g) for g in json.load(open('$MJ')).get('gpus',[])))")
+GPU_FLAGS=""; for g in $GPUS; do GPU_FLAGS="$GPU_FLAGS --device nvidia.com/gpu=$g"; done
+TP=$(wc -w <<<"$GPUS")
+```
+
+Two benefits: `--tensor-parallel-size` cannot drift from the device list, and
+allocation lives where `ARCHITECTURE.md` says operator-tunable settings belong.
+Empty/missing `gpus` should fall back to `=all` with TP=1 so existing slugs keep
+working.
+
+Note `gpu_memory_utilization: 0.85` is **per card** — with two cards that is 85%
+of each. Two models sharing one card would each need roughly half.
