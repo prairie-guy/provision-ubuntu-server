@@ -1,0 +1,21 @@
+[Unit]
+Description=NVIDIA GPU state at boot (persistence mode, optional power cap)
+Documentation=https://github.com/prairie-guy/provision-ubuntu-server
+# Ubuntu's own nvidia-persistenced.service runs with --no-persistence-mode and
+# StopWhenUnneeded=true, so enabling it does NOT give you persistence mode.
+# That is why this unit exists rather than a drop-in.
+After=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=90
+# The driver initialises asynchronously and nvidia-smi can fail for several
+# seconds after multi-user.target. Wait rather than race, or the unit is
+# `failed` on every boot with no GPU state applied.
+ExecStartPre=/bin/sh -c 'until /usr/bin/nvidia-smi -L >/dev/null 2>&1; do sleep 2; done'
+ExecStart=/usr/bin/nvidia-smi -pm 1
+__CAP_LINE__
+
+[Install]
+WantedBy=multi-user.target
