@@ -750,6 +750,17 @@ if want docker && (( DO_DOCKER )); then
   # xattrs, corrupts the overlay2 store silently.
   SKIP_DAEMON_JSON=0
   _current_root="$($SUDO docker info -f '{{.DockerRootDir}}' 2>/dev/null || true)"
+
+  # ADOPT an existing non-default data-root when none was requested. Otherwise a
+  # plain run on a box already configured with one would write a daemon.json
+  # without it, restart docker, and silently relocate storage to
+  # /var/lib/docker -- orphaning every image. Never change what was not asked
+  # to be changed.
+  if [[ -z "$DOCKER_DATA_ROOT" && -n "$_current_root" && "$_current_root" != "/var/lib/docker" ]]; then
+    warn "docker already uses data-root=$_current_root; keeping it."
+    warn "pass --data-root to change it deliberately."
+    DOCKER_DATA_ROOT="$_current_root"
+  fi
   if [[ -n "$DOCKER_DATA_ROOT" && -n "$_current_root" \
         && "$_current_root" != "$DOCKER_DATA_ROOT" \
         && -n "$($SUDO docker image ls -q 2>/dev/null)" ]]; then
