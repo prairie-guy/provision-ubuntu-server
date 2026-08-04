@@ -27,7 +27,12 @@ set -euo pipefail
 # leaves the rest unused. Grow by a percentage of the FREE extents, not 100%:
 # online ext4 growth is one-way, so the remainder is snapshot headroom.
 # This step is a no-op when the VG is already fully allocated.
-GROW_ROOT_LV_PCT="${GROW_ROOT_LV_PCT:-90}"      # --grow-pct
+# Leave this much of the volume group unallocated for snapshot CoW space and
+# take the rest. ABSOLUTE, not a percentage: snapshot headroom depends on how
+# much is written while a snapshot exists, not on how large the disk is. A
+# percentage under-reserves on a small disk and wastes terabytes on a large one.
+# Accepts a numfmt suffix (100G, 512M) or plain bytes. 0 takes everything.
+GROW_RESERVE="${GROW_RESERVE:-100G}"            # --reserve
 GROW_MIN_BYTES=$((1024*1024*1024))              # below this, not worth resizing
 
 # --- system packages --------------------------------------------------------
@@ -264,8 +269,8 @@ while (( $# )); do
     --data-root=*) DOCKER_DATA_ROOT="${1#*=}"; shift ;;
     --docker-user) DOCKER_GROUP_USER="${2:?--docker-user needs a name}"; shift 2 ;;
     --docker-user=*) DOCKER_GROUP_USER="${1#*=}"; shift ;;
-    --grow-pct)    GROW_ROOT_LV_PCT="${2:?--grow-pct needs a number}"; shift 2 ;;
-    --grow-pct=*)  GROW_ROOT_LV_PCT="${1#*=}"; shift ;;
+    --reserve)     GROW_RESERVE="${2:?--reserve needs a size, e.g. 100G}"; shift 2 ;;
+    --reserve=*)   GROW_RESERVE="${1#*=}"; shift ;;
     --only)        ONLY="${2:?--only needs a comma-separated step list}"; shift 2 ;;
     --only=*)      ONLY="${1#*=}"; shift ;;
     -h|--help)     sed -n '2,17p' "$0" | sed 's/^# \?//'; exit 0 ;;
@@ -293,8 +298,8 @@ want() { [[ -z "$ONLY" ]] || [[ ",$ONLY," == *",$1,"* ]]; }
 # a non-numeric value would corrupt the unit or fail at every boot.
 [[ -z "$GPU_POWER_CAP" || "$GPU_POWER_CAP" =~ ^[0-9]+$ ]] \
   || die "invalid --gpu-cap '$GPU_POWER_CAP': watts must be a whole number"
-[[ "$GROW_ROOT_LV_PCT" =~ ^[0-9]+$ ]] && (( GROW_ROOT_LV_PCT >= 1 && GROW_ROOT_LV_PCT <= 100 )) \
-  || die "invalid --grow-pct '$GROW_ROOT_LV_PCT': use 1-100"
+GROW_RESERVE_B="$(numfmt --from=iec "$GROW_RESERVE" 2>/dev/null)" \
+  || die "invalid --reserve '$GROW_RESERVE': use bytes or an IEC size like 100G"
 
 [[ "$(uname -s)" == "Linux" ]] || die "this script targets Linux"
 command -v apt-get >/dev/null || die "apt-get not found; this script targets Ubuntu/Debian"
@@ -414,7 +419,10 @@ lvm_probe() {
     *) LVM_WHY="/ is $LVM_FSTYPE; this script only grows ext4 and xfs"; return 1 ;;
   esac
 
-  LVM_ADD_B=$(( LVM_FREE_B * GROW_ROOT_LV_PCT / 100 ))
+  # Take everything above the reserve. Exact, not rounded to a percentage.
+  LVM_ADD_B=$(( LVM_FREE_B - GROW_RESERVE_B ))
+  (( LVM_ADD_B >= GROW_MIN_BYTES )) \
+    || { LVM_WHY="only $(hb "$LVM_FREE_B") unallocated in $LVM_VG, and $(hb "$GROW_RESERVE_B") is reserved -- nothing worth growing"; return 1; }
   LVM_OK=1
 }
 
@@ -444,7 +452,7 @@ if want lvm; then
     log "/ is $LVM_PATH ($LVM_FSTYPE) in volume group $LVM_VG"
     printf '      logical volume: %s\n' "$(hb "$LVM_SIZE_B")"
     printf '      unallocated:    %s\n' "$(hb "$LVM_FREE_B")"
-    printf '      would grow by:  ~%s (%s%% of free)\n' "$(hb "$LVM_ADD_B")" "$GROW_ROOT_LV_PCT"
+    printf '      would grow by:  %s   (leaving %s reserved)\n' "$(hb "$LVM_ADD_B")" "$(hb "$GROW_RESERVE_B")"
     printf '      then:           resize the filesystem online, / stays mounted\n'
     ask_yn "grow the root volume now?" n && DO_GROW_LV=1
   fi
@@ -550,8 +558,8 @@ if want lvm; then
     skip "leaving $LVM_PATH at its current size"
   else
     # Let LVM do the arithmetic with the same %FREE expression that was shown.
-    log "growing $LVM_PATH by ${GROW_ROOT_LV_PCT}% of free extents"
-    run $SUDO lvextend -l "+${GROW_ROOT_LV_PCT}%FREE" "$LVM_PATH"
+    log "growing $LVM_PATH by $(hb "$LVM_ADD_B"), leaving $(hb "$GROW_RESERVE_B") unallocated"
+    run $SUDO lvextend -L "+${LVM_ADD_B}b" "$LVM_PATH"
     # resize2fs takes the DEVICE; xfs_growfs takes the MOUNT POINT. Swapping
     # them is the most common way this goes wrong, so both are written out.
     case "$LVM_FSTYPE" in

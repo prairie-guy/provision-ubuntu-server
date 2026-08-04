@@ -66,7 +66,7 @@ silently doing nothing.
 | `--gpu-cap W` | per-GPU power cap for the systemd unit |
 | `--data-root PATH` | where docker keeps images |
 | `--docker-user NAME` | who gets added to the `docker` group |
-| `--grow-pct N` | percentage of free extents the `lvm` step takes (default 90) |
+| `--reserve SIZE` | leave this much of the VG unallocated for snapshots (default 100G) |
 | `--reboot` | reboot when finished, if the driver needs it |
 
 ## The nvidia driver is held on purpose
