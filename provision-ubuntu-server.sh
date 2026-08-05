@@ -117,6 +117,12 @@ NVIDIA_EXTRA_PKGS=(nvtop)
 GPU_POWER_CAP="${GPU_POWER_CAP:-}"              # watts, empty = stock 600W
 GPU_STATE_UNIT="gpu-state"
 
+# Watches for the failure mode that has no other symptom: an unattended kernel
+# upgrade whose dkms rebuild failed. The box runs on fine until the reboot that
+# finds no module and drops every GPU. A daily check turns that into a `failed`
+# unit you can see days ahead of the reboot.
+DKMS_CHECK_UNIT="nvidia-dkms-check"
+
 # --- docker -----------------------------------------------------------------
 DOCKER_PACKAGES=(
   docker-ce docker-ce-cli containerd.io
@@ -190,6 +196,9 @@ ask_yn() {
 list_replace() {
   local f
   for f in "$@"; do
+    # Only files that actually exist: "REPLACE" about a file that is not there
+    # is a lie, and creating a new file needs no warning.
+    [[ -e "$f" ]] || continue
     printf '      \033[1mREPLACE\033[0m %-44s backup: %s\n' "$f" "$(basename "$f").bak-$STAMP"
   done
 }
@@ -522,6 +531,7 @@ have_docker()   { have_pkg docker-ce; }
 have_nvctk()    { have_pkg nvidia-container-toolkit; }
 have_tailscale(){ have_pkg tailscale; }
 have_gpustate() { [[ -f "/etc/systemd/system/$GPU_STATE_UNIT.service" ]]; }
+have_dkms_check() { [[ -f "/etc/systemd/system/$DKMS_CHECK_UNIT.service" ]]; }
 ts_logged_in()  { tailscale status >/dev/null 2>&1; }
 
 # LVM probe. Read-only, but needs root -- hence the priming above.
@@ -625,7 +635,9 @@ if (( HELP )); then
     tailscale "install + tailscale up (interactive browser login)" \
     mosh      "mosh, and a UTF-8 locale for it" \
     nvidia    "the driver: shows what is installed, held and available;" \
-    ""        "  type a branch number to switch, Enter to keep" \
+    ""        "  type a branch number to switch, Enter to keep;" \
+    ""        "  plus a daily dkms check, so a failed rebuild is seen" \
+    ""        "  before the reboot that would drop every GPU" \
     docker    "Docker Engine from Docker's own repo, and daemon.json" \
     nvctk     "NVIDIA Container Toolkit, so containers see the GPUs" \
     rootless  "docker for named accounts WITHOUT the root-equivalent group" \
@@ -720,6 +732,27 @@ if (( DOCTOR )); then
     fi
   else
     doc_warn "$NVIDIA_DRIVER_PKG is not installed"
+  fi
+
+  # The check unit is itself a thing that can be missing or broken, so report it
+  # rather than trusting that installing it once means it is still running.
+  if have_pkg "$NVIDIA_DRIVER_PKG"; then
+    if ! have_dkms_check; then
+      doc_warn "no $DKMS_CHECK_UNIT -- a failed dkms rebuild would stay invisible"
+      doc_note "until a reboot boots a kernel with no module and drops every GPU"
+      doc_fix "re-run and answer yes to the dkms check question"
+    elif systemctl is-enabled "$DKMS_CHECK_UNIT.timer" >/dev/null 2>&1; then
+      if systemctl is-failed "$DKMS_CHECK_UNIT.service" >/dev/null 2>&1; then
+        doc_fail "$DKMS_CHECK_UNIT last run FAILED -- a kernel is missing its nvidia module"
+        doc_note "$(systemctl show -p StatusText --value "$DKMS_CHECK_UNIT.service" 2>/dev/null)"
+        doc_fix "sudo dkms autoinstall   (then: journalctl -u $DKMS_CHECK_UNIT)"
+      else
+        doc_ok "$DKMS_CHECK_UNIT.timer enabled, last run clean"
+      fi
+    else
+      doc_warn "$DKMS_CHECK_UNIT is installed but its timer is not enabled"
+      doc_fix "sudo systemctl enable --now $DKMS_CHECK_UNIT.timer"
+    fi
   fi
 
   if have_gpustate; then
@@ -864,7 +897,7 @@ fi
 DO_GROW_LV=0
 FORCE_DOCKER=$FORCE; FORCE_NVCTK=$FORCE; FORCE_GPUSTATE=$FORCE
 FORCE_TAILSCALE=$FORCE; FORCE_NVIDIA=$FORCE
-DO_TS_UP=0; DO_HOLD_NVIDIA=0; DO_UPGRADE=0
+DO_TS_UP=0; DO_HOLD_NVIDIA=0; DO_UPGRADE=0; DO_DKMS_CHECK=0
 
 if want lvm; then
   if lvm_probe; then
@@ -939,6 +972,12 @@ if want nvidia; then
          && ask_yn "update to $(pkg_candidate_ver "$NVIDIA_DRIVER_PKG") on this branch?" n; then
       FORCE_NVIDIA=1
     fi
+  fi
+  # Small, read-only, and the only warning you would get before a reboot takes
+  # the GPUs down -- so it defaults to yes.
+  if have_pkg "$NVIDIA_DRIVER_PKG" && ! have_dkms_check; then
+    ask_yn "install a daily check that dkms has built the nvidia module for every installed kernel?" y \
+      && DO_DKMS_CHECK=1
   fi
   # Holding matters because the metapackage's deps are UNVERSIONED, so an
   # unattended security update can move libnvidia-* underneath the loaded
@@ -1222,6 +1261,38 @@ if want nvidia; then
       warn "dkms has NOT built the nvidia module for $(uname -r)."
       warn "Check before rebooting:  dkms status; cat /var/lib/dkms/nvidia/*/build/make.log"
     fi
+  fi
+
+  # The dkms check unit. Installed with the driver because it exists to protect
+  # it: without this, a failed rebuild after an unattended kernel upgrade is
+  # silent until the reboot that drops every GPU.
+  if (( DO_DKMS_CHECK )) || { have_dkms_check && (( FORCE_NVIDIA )); }; then
+    _changed=0
+    if [[ -f /usr/local/sbin/nvidia-dkms-check ]] \
+       && cmp -s "$TEMPLATES/nvidia-dkms-check.sh" /usr/local/sbin/nvidia-dkms-check; then
+      skip "/usr/local/sbin/nvidia-dkms-check already current"
+    else
+      list_replace /usr/local/sbin/nvidia-dkms-check
+      backup /usr/local/sbin/nvidia-dkms-check
+      run $SUDO install -D -m 0755 -o root -g root \
+        "$TEMPLATES/nvidia-dkms-check.sh" /usr/local/sbin/nvidia-dkms-check
+      _changed=1
+    fi
+    for _u in "$DKMS_CHECK_UNIT.service" "$DKMS_CHECK_UNIT.timer"; do
+      if [[ -f "/etc/systemd/system/$_u" ]] && cmp -s "$TEMPLATES/$_u" "/etc/systemd/system/$_u"; then
+        skip "$_u already current"
+      else
+        list_replace "/etc/systemd/system/$_u"
+        backup "/etc/systemd/system/$_u"
+        run $SUDO install -D -m 0644 -o root -g root "$TEMPLATES/$_u" "/etc/systemd/system/$_u"
+        _changed=1
+      fi
+    done
+    if (( _changed )); then
+      run $SUDO systemctl daemon-reload
+    fi
+    # Enable the TIMER, not the service: the service is what the timer runs.
+    run $SUDO systemctl enable --now "$DKMS_CHECK_UNIT.timer"
   fi
 
   if (( DO_HOLD_NVIDIA )) || [[ -n "${WAS_HELD:-}" ]]; then

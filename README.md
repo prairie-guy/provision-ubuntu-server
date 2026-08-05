@@ -79,6 +79,15 @@ and answer yes to the rootless docker question in step 10. See
 | `rootless` | the root-only prerequisites so named accounts can run docker *without* the docker group | asks when docker is present |
 | `gpustate` | systemd unit for GPU persistence mode | asks, **yes** |
 
+The `nvidia` step also installs a **daily dkms check** (`nvidia-dkms-check.timer`),
+asked with the driver and defaulting to yes. It exists for one failure with no
+other symptom: an unattended kernel upgrade whose dkms rebuild *failed*. The box
+keeps running perfectly on the old kernel with the old module resident — until
+the next reboot boots the new kernel, finds no module, and every GPU disappears.
+The check verifies the module is built for **every installed kernel**, not just
+the running one, and exits non-zero when one is missing, so the unit shows in
+`systemctl --failed` and in `doctor` days before that reboot.
+
 Every step is always reached; what it *does* is decided by the question it
 asked. There is no flag for running a subset — a partial provision is how you
 get a box that looks finished and is not.

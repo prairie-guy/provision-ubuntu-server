@@ -1,0 +1,16 @@
+[Unit]
+Description=Check the nvidia dkms module daily, and shortly after boot
+Documentation=https://github.com/prairie-guy/provision-ubuntu-server
+
+[Timer]
+# Shortly after boot, so a kernel installed yesterday is caught today rather
+# than at the reboot that would have broken it.
+OnBootSec=10min
+# Daily thereafter. unattended-upgrades runs on its own schedule, so there is no
+# single moment to hook; checking every day catches a failed rebuild within a
+# day of it happening, which is long before the next reboot on this box.
+OnUnitActiveSec=1d
+Persistent=true
+
+[Install]
+WantedBy=timers.target

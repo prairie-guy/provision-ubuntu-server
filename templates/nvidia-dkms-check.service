@@ -1,0 +1,11 @@
+[Unit]
+Description=Verify the nvidia dkms module is built for every installed kernel
+Documentation=https://github.com/prairie-guy/provision-ubuntu-server
+# Inert on a box with no NVIDIA card, rather than failing at every boot.
+ConditionPathExistsGlob=/dev/nvidia[0-9]*
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nvidia-dkms-check
+# No RemainAfterExit: this is a check, not a state. Leaving it "active" would
+# hide the next run's result behind the first one's.
