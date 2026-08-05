@@ -195,6 +195,17 @@ ask_yn() {
   [[ "${reply,,}" == y* ]]
 }
 
+# Name a file this run is about to replace, and where its backup goes -- the
+# same format and the same promise as the account script. Answering yes to
+# something that rewrites a file under /etc should not require trusting the
+# script about which file it meant.
+list_replace() {
+  local f
+  for f in "$@"; do
+    printf '      \033[1mREPLACE\033[0m %-44s backup: %s\n' "$f" "$(basename "$f").bak-$STAMP"
+  done
+}
+
 # Back up a file before replacing it.
 backup() {
   local f="$1"
@@ -1037,7 +1048,11 @@ fi
 
 if want gpustate; then
   if have_gpustate; then
-    (( ! FORCE_GPUSTATE )) && ask_yn "the $GPU_STATE_UNIT unit is installed -- replace it?" n && FORCE_GPUSTATE=1
+    if (( ! FORCE_GPUSTATE )); then
+      printf '\n'
+      list_replace "/etc/systemd/system/$GPU_STATE_UNIT.service"
+      ask_yn "the $GPU_STATE_UNIT unit is installed -- replace it?" n && FORCE_GPUSTATE=1
+    fi
   else
     ask_yn "install a systemd unit enabling GPU persistence mode at boot (power cap: ${GPU_POWER_CAP:-none, stock 600W})?" y || SKIP_GPUSTATE=1
   fi
@@ -1087,6 +1102,7 @@ if want limits && [[ -n "$MEMLOCK_ACCOUNTS" ]]; then
   if cmp -s "$_lim" /etc/security/limits.d/90-memlock.conf; then
     skip "memlock limits already current for: $MEMLOCK_ACCOUNTS"
   else
+    list_replace /etc/security/limits.d/90-memlock.conf
     backup /etc/security/limits.d/90-memlock.conf
     log "raising memlock for: $MEMLOCK_ACCOUNTS (applies at their next login)"
     run $SUDO install -D -m 0644 -o root -g root "$_lim" /etc/security/limits.d/90-memlock.conf
@@ -1306,8 +1322,8 @@ if want docker && (( DO_DOCKER )); then
     if cmp -s "$_dj" /etc/docker/daemon.json; then
       skip "/etc/docker/daemon.json already current"
     else
+      list_replace /etc/docker/daemon.json
       backup /etc/docker/daemon.json
-      log "writing /etc/docker/daemon.json"
       run $SUDO install -D -m 0644 -o root -g root "$_dj" /etc/docker/daemon.json
       DOCKER_NEEDS_RESTART=1
     fi
@@ -1445,6 +1461,7 @@ if want gpustate && [[ -z "${SKIP_GPUSTATE:-}" ]]; then
   if cmp -s "$_unit" "/etc/systemd/system/$GPU_STATE_UNIT.service" && (( ! FORCE_GPUSTATE )); then
     skip "$GPU_STATE_UNIT.service already current"
   else
+    list_replace "/etc/systemd/system/$GPU_STATE_UNIT.service"
     backup "/etc/systemd/system/$GPU_STATE_UNIT.service"
     log "installing /etc/systemd/system/$GPU_STATE_UNIT.service (cap: ${GPU_POWER_CAP:-none})"
     run $SUDO install -D -m 0644 -o root -g root "$_unit" "/etc/systemd/system/$GPU_STATE_UNIT.service"
