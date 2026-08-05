@@ -433,7 +433,7 @@ nvidia_running_version() {
 # step warn that dkms had failed when it had not.
 nvidia_dkms_ok() {
   local line kver
-  kver="$(uname -r)"
+  kver="${1:-$(uname -r)}"
   while IFS= read -r line; do
     if [[ "$line" == *", $kver, "*": installed" ]]; then return 0; fi
   done < <(dkms status -m nvidia 2>/dev/null)
@@ -451,6 +451,17 @@ gpu_ready() {
   [[ "$want" == "$have" ]]         || return 1
   nvidia-smi -L >/dev/null 2>&1
 }
+# The kernel version a pending reboot will land on, if a kernel is why. Empty
+# when the reboot was requested by something else.
+pending_kernel() {
+  [[ -s /var/run/reboot-required.pkgs ]] || return 0
+  sed -n 's/^linux-image-\([0-9][^ ]*\)$/\1/p' /var/run/reboot-required.pkgs | sort -V | tail -1
+}
+reboot_why() {
+  [[ -s /var/run/reboot-required.pkgs ]] || { printf 'unknown'; return 0; }
+  sort -u /var/run/reboot-required.pkgs | tr '\n' ' '
+}
+
 reboot_pending() {
   [[ -f /var/run/reboot-required ]] && return 0
   have_pkg "$NVIDIA_DRIVER_PKG" && ! gpu_ready && return 0
@@ -810,8 +821,21 @@ if (( DOCTOR )); then
   fi
 
   if reboot_pending; then
-    doc_warn "a reboot is pending"
-    doc_fix "" "sudo reboot"
+    doc_warn "a reboot is pending -- requested by: $(reboot_why)"
+    _pk="$(pending_kernel)"
+    if [[ -n "$_pk" && "$_pk" != "$(uname -r)" ]] && have_pkg "$NVIDIA_DRIVER_PKG"; then
+      # HANDOFF called this out: a kernel lands, dkms rebuilds silently, and a
+      # FAILED rebuild stays invisible until the reboot takes all four GPUs
+      # down. A module built for the RUNNING kernel says nothing about the next.
+      if nvidia_dkms_ok "$_pk"; then
+        doc_ok "dkms has built the nvidia module for $_pk, the kernel you will boot into"
+      else
+        doc_fail "dkms has NOT built the nvidia module for $_pk, which this reboot boots into"
+        doc_note "rebooting now loses every GPU until it is rebuilt"
+        doc_fix "sudo dkms autoinstall -k $_pk"
+      fi
+    fi
+    doc_fix "sudo reboot"
   fi
 
   printf '\n'
@@ -1456,10 +1480,31 @@ echo
 
 if reboot_pending; then
   warn "A REBOOT IS REQUIRED"
+  # Name the cause. Printing driver details under this heading made an unrelated
+  # kernel update look as though the driver had moved.
+  warn "  requested by: $(reboot_why)"
+  _pk="$(pending_kernel)"
   if have_pkg "$NVIDIA_DRIVER_PKG"; then
-    warn "  $NVIDIA_DRIVER_PKG $(nvidia_pkg_version) installed; module $(nvidia_running_version 2>/dev/null || echo 'not loaded')."
-    nvidia_dkms_ok && warn "  dkms has built it for $(uname -r)." \
-                   || warn "  dkms has NOT built it for $(uname -r) -- investigate before rebooting."
+    if [[ "$(nvidia_pkg_version)" == "$(nvidia_running_version 2>/dev/null)" ]]; then
+      warn "  not the nvidia driver: package and loaded module are both $(nvidia_pkg_version)."
+    else
+      warn "  $NVIDIA_DRIVER_PKG $(nvidia_pkg_version) installed; module $(nvidia_running_version 2>/dev/null || echo 'not loaded')."
+    fi
+    # The kernel that matters is the one being booted INTO. A dkms module built
+    # for the running kernel says nothing about the one after the reboot -- and
+    # a missing one there takes every GPU down.
+    if [[ -n "$_pk" && "$_pk" != "$(uname -r)" ]]; then
+      if nvidia_dkms_ok "$_pk"; then
+        warn "  dkms has built the nvidia module for $_pk, the kernel you will boot into."
+      else
+        warn "  dkms has NOT built the nvidia module for $_pk, which this reboot BOOTS INTO."
+        warn "  Rebooting now loses every GPU. Check first:  dkms status -m nvidia"
+      fi
+    elif nvidia_dkms_ok; then
+      warn "  dkms has built it for $(uname -r)."
+    else
+      warn "  dkms has NOT built it for $(uname -r) -- investigate before rebooting."
+    fi
   fi
   warn "    sudo reboot"
   warn "    cd $SCRIPT_DIR && ./provision-ubuntu-server.sh"
