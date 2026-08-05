@@ -7,10 +7,11 @@
 # to install the system packages both of those need, so no per-account run ever
 # escalates to sudo.
 #
-# RUN IT WITH NO FLAGS. That is the intended way to use this:
+# THERE ARE THREE COMMANDS. That is the whole interface:
 #
-#   ./provision-ubuntu-server.sh --check     # same questions, does nothing
-#   ./provision-ubuntu-server.sh             # <- this
+#   ./provision-ubuntu-server.sh             ask, then do it
+#   ./provision-ubuntu-server.sh --dry-run   ask, then print what it would do
+#   ./provision-ubuntu-server.sh doctor      check this box, offer fixes
 #
 # It asks a plain question about each thing it could do, phrased by what it
 # actually found on the box, and asks ALL of them before doing any work. Then it
@@ -18,25 +19,18 @@
 # kept warm, so not even a driver install pauses for a password. Press Enter
 # through everything for the conservative answer.
 #
-# The flags below are NOT the interface. They exist so a second box or an
-# unattended run can answer the questions up front:
-#
-#   ./provision-ubuntu-server.sh --only nvidia    # run just these steps
-#   ./provision-ubuntu-server.sh --reinstall      # refresh what is already installed
-#   ./provision-ubuntu-server.sh --docker --nvctk # answer those questions up front
-#   ./provision-ubuntu-server.sh --rootless-accounts scratch   # docker for an
-#                                                 # account, without root
-#
-# Values rather than decisions -- which driver branch, how much shm, where docker
-# keeps images -- live in the CONFIGURATION block below. Edit those once for the
-# box; each also has a flag for overriding it on a single run.
+# There are no other options, deliberately. Anything consequential enough to
+# want a flag is consequential enough to be asked about, and anything that is a
+# VALUE rather than a decision -- which driver branch, where docker keeps
+# images, the per-GPU power cap -- lives in the CONFIGURATION block below, where
+# it carries a comment saying why it is what it is.
 #
 # Idempotent: safe to re-run, and re-running is how you change things later.
 #
 # The nvidia driver is HELD (pinned). Neither apt, nor unattended-upgrades, nor
-# a re-run of this script will move it. It changes only if you ask:
-#   ./provision-ubuntu-server.sh --only nvidia --reinstall     # newer point release
-#   NVIDIA_DRIVER_PKG=nvidia-driver-610-open ...  --only nvidia  # different branch
+# a re-run of this script will move it. It changes only when you say so, at the
+# driver question, which shows what is installed and which branches exist and
+# lets you type a different one. Enter keeps what you have.
 #
 set -euo pipefail
 
@@ -322,52 +316,44 @@ apt_upgrade_pkgs() {
 DOCTOR=0; HELP=0
 if [[ "${1:-}" == doctor ]]; then DOCTOR=1; shift; fi
 
+# Three things only. Every other decision is a question this script asks, and
+# every value it uses is in the CONFIGURATION block above.
+#
+# The deleted flags were not neutral. --only ran a partial provision, which on
+# this box could mean a driver installed with no container toolkit to use it.
+# --reinstall answered yes to everything at once, including a driver reinstall
+# on a machine serving models. --data-root and --gpu-cap changed where images
+# live and how much power the cards draw, from a command line, with no
+# confirmation. Values belong in the file, where they carry a comment saying why.
 while (( $# )); do
   case "$1" in
     --dry-run)     CHECK_ONLY=1; shift ;;
-    --check)       CHECK_ONLY=1; shift ;;   # old name for --dry-run; still works
-    --reinstall)   FORCE=1; shift ;;
-    --docker)      DO_DOCKER=1; shift ;;
-    --nvctk)       DO_NVCTK=1; DO_DOCKER=1; shift ;;
-    --reboot)      DO_REBOOT=1; shift ;;
-    --hostname)    SYSTEM_HOSTNAME="${2:?--hostname needs a name}"; HOSTNAME_EXPLICIT=1; shift 2 ;;
-    --hostname=*)  SYSTEM_HOSTNAME="${1#*=}"; HOSTNAME_EXPLICIT=1; shift ;;
-    --memlock-accounts)   MEMLOCK_ACCOUNTS="${2:?--memlock-accounts needs a name or space-separated list}"; shift 2 ;;
-    --memlock-accounts=*) MEMLOCK_ACCOUNTS="${1#*=}"; shift ;;
-    --rootless-accounts)   ROOTLESS_ACCOUNTS="${2:?--rootless-accounts needs a name or space-separated list}"; ROOTLESS_EXPLICIT=1; shift 2 ;;
-    --rootless-accounts=*) ROOTLESS_ACCOUNTS="${1#*=}"; ROOTLESS_EXPLICIT=1; shift ;;
-    --gpu-cap)     GPU_POWER_CAP="${2:?--gpu-cap needs a wattage}"; shift 2 ;;
-    --gpu-cap=*)   GPU_POWER_CAP="${1#*=}"; shift ;;
-    --data-root)   DOCKER_DATA_ROOT="${2:?--data-root needs a path}"; shift 2 ;;
-    --data-root=*) DOCKER_DATA_ROOT="${1#*=}"; shift ;;
-    --docker-user) DOCKER_GROUP_USER="${2:?--docker-user needs a name}"; shift 2 ;;
-    --docker-user=*) DOCKER_GROUP_USER="${1#*=}"; shift ;;
-    --reserve)     GROW_RESERVE="${2:?--reserve needs a size, e.g. 100G}"; shift 2 ;;
-    --reserve=*)   GROW_RESERVE="${1#*=}"; shift ;;
-    --only)        ONLY="${2:?--only needs a comma-separated step list}"; shift 2 ;;
-    --only=*)      ONLY="${1#*=}"; shift ;;
     -h|--help)     HELP=1; shift ;;
-    *) die "unknown argument: $1 (try --help)" ;;
+    *) die "unknown argument: $1
+
+   This script takes no options beyond --dry-run and --help.
+   To choose what happens, run it and answer the questions:
+       ./provision-ubuntu-server.sh
+   To change a value (driver branch, data-root, power cap, shm size),
+   edit the CONFIGURATION block at the top of the script.
+   To see the state of this box and what would change:
+       ./provision-ubuntu-server.sh --help
+       ./provision-ubuntu-server.sh doctor" ;;
   esac
 done
 
 # A step runs unless --only was given and does not name it. Unknown names are
 # rejected: a typo would otherwise run nothing and exit 0, looking successful.
 VALID_STEPS=(hostname limits lvm apt packages tailscale mosh nvidia docker nvctk rootless gpustate)
-if [[ -n "$ONLY" ]]; then
-  IFS=, read -r -a _requested <<<"$ONLY"
-  for _s in "${_requested[@]}"; do
-    [[ " ${VALID_STEPS[*]} " == *" $_s "* ]] \
-      || die "unknown step '$_s'. Valid: ${VALID_STEPS[*]}"
-  done
-fi
+# No --only any more: every step is reached, and what it DOES is decided by the
+# question it asked. Kept as a function so the step guards read unchanged.
 want() { [[ -z "$ONLY" ]] || [[ ",$ONLY," == *",$1,"* ]]; }
 
 # Default to the current name so pressing Enter keeps it.
-[[ -n "${HOSTNAME_EXPLICIT:-}" ]] || HOSTNAME_EXPLICIT=0
+[[ -n "${SYSTEM_HOSTNAME:-}" ]] && HOSTNAME_EXPLICIT=1 || HOSTNAME_EXPLICIT=0
 [[ -n "$SYSTEM_HOSTNAME" ]] || SYSTEM_HOSTNAME="$(hostname)"
 
-[[ -n "${ROOTLESS_EXPLICIT:-}" ]] || ROOTLESS_EXPLICIT=0
+[[ -n "$ROOTLESS_ACCOUNTS" ]] && ROOTLESS_EXPLICIT=1 || ROOTLESS_EXPLICIT=0
 
 # Validated here rather than in the step: a typo'd account name should stop the
 # run before anything has been changed, not after ten minutes of apt.
@@ -585,7 +571,7 @@ lvm_probe() {
 # flags. In particular it names what has an update waiting, so you never have to
 # start a run to find out whether there is anything to do.
 if (( HELP )); then
-  sed -n '2,40p' "$0" | sed 's/^# \?//'
+  sed -n '2,34p' "$0" | sed 's/^# \?//'
   printf '\033[1mSTATE OF THIS BOX\033[0m\n\n'
   printf '  apt package lists: %sd old\n' "$(apt_meta_age_days)"
 
@@ -619,9 +605,47 @@ if (( HELP )); then
   fi
   (( _any_upd )) || printf '    nothing -- every managed component is current\n'
 
-  printf '\n  \033[1msteps\033[0m: %s\n' "${VALID_STEPS[*]}"
-  printf '\n  \033[1mdoctor\033[0m checks this box and offers to fix what it finds:\n'
-  printf '      ./provision-ubuntu-server.sh doctor\n\n'
+  printf '\n\033[1mWHAT A RUN WOULD ASK ABOUT\033[0m\n\n'
+  printf '  One question each, in this order, phrased by what is already there.\n'
+  printf '  Anything already done is reported and skipped, not asked about again.\n\n'
+  printf '    %-12s %s\n' \
+    hostname  "the system hostname (asked before tailscale registers a name)" \
+    limits    "memlock for named accounts (MEMLOCK_ACCOUNTS)" \
+    lvm       "grow / into unallocated VG space -- asked, default no" \
+    apt       "apt update + upgrade, if anything is upgradable" \
+    packages  "${#SYSTEM_PACKAGES[@]} system packages both scripts need" \
+    tailscale "install + tailscale up (interactive browser login)" \
+    mosh      "mosh, and a UTF-8 locale for it" \
+    nvidia    "the driver: shows what is installed, held and available;" \
+    ""        "  type a branch number to switch, Enter to keep" \
+    docker    "Docker Engine from Docker's own repo, and daemon.json" \
+    nvctk     "NVIDIA Container Toolkit, so containers see the GPUs" \
+    rootless  "docker for named accounts WITHOUT the root-equivalent group" \
+    gpustate  "a systemd unit setting GPU persistence mode at boot"
+
+  printf '\n\033[1mWHAT YOU CAN CHANGE, AND WHERE\033[0m\n\n'
+  printf '  There are no options for these. Edit the CONFIGURATION block at the top\n'
+  printf '  of %s -- each carries a comment explaining the\n' "$(basename "$0")"
+  printf '  choice. They are properties of this machine, not per-run decisions.\n\n'
+  printf '    %-22s %s\n' \
+    "NVIDIA_DRIVER_PKG" "$NVIDIA_DRIVER_PKG   (also choosable at the driver question)" \
+    "DOCKER_DATA_ROOT"  "${DOCKER_DATA_ROOT:-/var/lib/docker (docker default)}" \
+    "DOCKER_SHM_SIZE"   "$DOCKER_SHM_SIZE   (NCCL dies at docker's 64M default)" \
+    "DOCKER_GROUP_USER" "$DOCKER_GROUP_USER   -- gets ROOT-EQUIVALENT docker access" \
+    "GPU_POWER_CAP"     "${GPU_POWER_CAP:-none -- each card at its stock 600W}" \
+    "GROW_RESERVE"      "$GROW_RESERVE   left unallocated in the VG for snapshots" \
+    "MEMLOCK_ACCOUNTS"  "${MEMLOCK_ACCOUNTS:-none}" \
+    "ROOTLESS_ACCOUNTS" "${ROOTLESS_ACCOUNTS:-none set -- you are asked at the prompt}" \
+    "SYSTEM_PACKAGES"   "${#SYSTEM_PACKAGES[@]} packages -- adding a line is safe, removing one" \
+    ""                  "  makes some later per-account run need sudo"
+
+  printf '\n\033[1mWHAT IT WILL NOT DO\033[0m\n\n'
+  printf '  move the nvidia driver unless you ask at the driver question\n'
+  printf '  migrate docker'"'"'s image store -- it adopts what is there and says so\n'
+  printf '  restart docker while containers are running -- it warns instead\n'
+  printf '  overwrite a config file without a NAME.bak-<timestamp> copy first\n'
+  printf '  delete anything: this script has no rm outside its own temp directory\n'
+  printf '  reboot on its own -- it tells you when one is needed\n\n'
   exit 0
 fi
 
@@ -669,7 +693,7 @@ if (( DOCTOR )); then
       doc_fail "nvidia packages are NOT held"
       doc_note "unattended-upgrades can move libnvidia-* under the loaded module,"
       doc_note "detaching the GPUs from every running container"
-      doc_fix "hold the nvidia packages" "$SCRIPT_DIR/provision-ubuntu-server.sh --only nvidia"
+      doc_fix "hold the nvidia packages" "$SCRIPT_DIR/provision-ubuntu-server.sh"
     fi
     if gpu_ready; then
       doc_ok "driver $(nvidia_running_version) loaded, $(nvidia-smi -L 2>/dev/null | wc -l) GPU(s) visible"
@@ -711,7 +735,7 @@ if (( DOCTOR )); then
     fi
   elif gpu_ready; then
     doc_warn "no $GPU_STATE_UNIT.service -- persistence mode is not set at boot"
-    doc_fix "install the GPU state unit" "$SCRIPT_DIR/provision-ubuntu-server.sh --only gpustate"
+    doc_fix "install the GPU state unit" "$SCRIPT_DIR/provision-ubuntu-server.sh"
   fi
 
   # --- docker: unbounded logs fill / on a box running a long-lived server, and
@@ -724,7 +748,7 @@ if (( DOCTOR )); then
     else
       doc_fail "docker has NO log rotation -- the json-file driver is unbounded"
       doc_note "a long-running container writing progress lines will fill /"
-      doc_fix "write /etc/docker/daemon.json" "$SCRIPT_DIR/provision-ubuntu-server.sh --only docker"
+      doc_fix "write /etc/docker/daemon.json" "$SCRIPT_DIR/provision-ubuntu-server.sh"
     fi
     if pkg_upgradable docker-ce; then
       doc_note "note: docker-ce $(pkg_candidate_ver docker-ce) is available"
