@@ -18,6 +18,11 @@
 # Idempotent: safe to re-run. Every question is asked before any work starts, so
 # once you have answered them the run does not stop for input.
 #
+# The nvidia driver is HELD (pinned). Neither apt, nor unattended-upgrades, nor
+# a re-run of this script will move it. It changes only if you ask:
+#   ./provision-ubuntu-server.sh --only nvidia --reinstall     # newer point release
+#   NVIDIA_DRIVER_PKG=nvidia-driver-610-open ...  --only nvidia  # different branch
+#
 set -euo pipefail
 
 # ============================================================================
@@ -319,7 +324,7 @@ while (( $# )); do
     --reserve=*)   GROW_RESERVE="${1#*=}"; shift ;;
     --only)        ONLY="${2:?--only needs a comma-separated step list}"; shift 2 ;;
     --only=*)      ONLY="${1#*=}"; shift ;;
-    -h|--help)     sed -n '2,17p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help)     sed -n '2,25p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *) die "unknown argument: $1 (try --help)" ;;
   esac
 done
@@ -1124,6 +1129,23 @@ if gpu_ready; then
   echo
   log "GPUs: $(nvidia-smi -L 2>/dev/null | wc -l), persistence $(nvidia-smi --query-gpu=persistence_mode --format=csv,noheader 2>/dev/null | head -1), cap ${GPU_POWER_CAP:-stock}"
   log "live changes: gpu-power (from the account repo);  persistent: GPU_POWER_CAP + --only gpustate"
+
+  # State the pin explicitly, every run. The whole point of holding the driver is
+  # that it does not move by surprise -- which is only reassuring if you can see
+  # that it is still held, and know the one way to move it on purpose.
+  _held_n="$(apt-mark showhold 2>/dev/null | grep -cE '^(nvidia-|libnvidia-)' || true)"
+  if (( _held_n )); then
+    log "driver: $NVIDIA_DRIVER_PKG $(nvidia_pkg_version) is PINNED -- $_held_n packages held."
+    log "  apt, unattended-upgrades and a re-run of this script cannot move it."
+    log "  It changes only if you ask, by one of:"
+    echo "    ./provision-ubuntu-server.sh --only nvidia --reinstall    # newer point release"
+    echo "    NVIDIA_DRIVER_PKG=nvidia-driver-610-open ./provision-ubuntu-server.sh --only nvidia"
+    echo "    (a driver change needs a reboot before the new module loads)"
+  else
+    warn "the nvidia packages are NOT held -- an unattended-upgrades run can move"
+    warn "libnvidia-* under the loaded module and detach the GPUs from running"
+    warn "containers. Fix:  ./provision-ubuntu-server.sh --only nvidia"
+  fi
 fi
 
 if [[ -n "$ROOTLESS_READY" ]]; then

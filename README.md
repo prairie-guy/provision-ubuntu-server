@@ -76,6 +76,128 @@ silently doing nothing.
 | `--reserve SIZE` | leave this much of the VG unallocated for snapshots (default 100G) |
 | `--reboot` | reboot when finished, if the driver needs it |
 
+Every flag also has an environment-variable form (`NVIDIA_DRIVER_PKG`,
+`DOCKER_SHM_SIZE`, `GROW_RESERVE`, …) — see the CONFIGURATION block at the top
+of the script. Editing that block changes the default permanently for this box;
+setting the variable on the command line changes it for one run.
+
+## Re-running is safe, and is how you change things
+
+There is no separate "update" mode. **Re-running the script *is* the update.**
+It probes the real system every time and does only what is not already done, so
+a second run after a reboot finishes what the first deferred, and a run against
+an already-provisioned box is mostly a list of `--` skip lines.
+
+Nothing is recorded in a stamp file, deliberately. A stamp file becomes a second
+source of truth that goes stale the moment someone runs `apt` by hand — and then
+the script starts making decisions from fiction. Because every check reads the
+live system instead, a package you installed yourself, a config you edited, and
+a run you interrupted half way through are all states the next run reads
+correctly.
+
+These rules hold in every step, and are what make a re-run boring:
+
+* **`--check` changes nothing, and is honest.** Every mutation goes through a
+  `run` wrapper, so a dry run prints the exact command it would have executed,
+  prefixed `[would run]`. Anything that cannot go through that wrapper gets an
+  explicit dry-run branch. Start here, always — and you can narrow it:
+
+  ```bash
+  ./provision-ubuntu-server.sh --check                # the whole box
+  ./provision-ubuntu-server.sh --check --only nvidia  # one step
+  ```
+
+* **Files are compared before they are written.** Config files are generated in
+  full and `cmp`'d against what is on disk. Identical means the file is not
+  touched at all — no rewrite, no backup, no daemon restart. Different means the
+  existing file is copied to `NAME.bak-YYYYmmdd-HHMMSS` *first*.
+
+* **All questions are asked before any work starts,** and sudo is primed once up
+  front and kept warm. Once you have answered, a long run never stops for input
+  — you can walk away from a driver install.
+
+* **No terminal means every default.** `... < /dev/null` never blocks and never
+  prompts, which is what makes the script safe to run from cron or another
+  script. Defaults are conservative: component installs default to *no*.
+
+* **This script deletes nothing.** It has no `rm` outside its own temp
+  directory: no account removal, no `lvremove`, no `mkfs`, no image pruning. The
+  destructive operations it *could* do, it refuses and prints instructions for
+  instead (see the data-root case below).
+
+* **Typos are rejected, not ignored.** An unknown `--only` step or an unknown
+  flag is a hard error. A mistyped step name that silently ran nothing and
+  exited 0 would look exactly like success.
+
+### What a re-run will never do on its own
+
+This is the table to read if you are wondering whether it is safe to run right
+now, on a box that is serving models.
+
+| it will never | what a plain re-run actually does | to do it deliberately |
+|---|---|---|
+| move the nvidia driver | reports `installed and loaded, 4 GPU(s)` and moves on | `--only nvidia --reinstall`, or `NVIDIA_DRIVER_PKG=…` |
+| unhold the nvidia packages | reports `already held (15 packages)` | same as above — the unhold is part of a deliberate change |
+| migrate docker's image store | adopts the existing `data-root` and keeps it | stop docker, `rsync -aHAX`, then `--data-root` (the script prints the recipe) |
+| restart docker under running containers | warns and leaves it to you | `sudo systemctl restart docker` when convenient |
+| overwrite a config file | backs up first, or skips if identical | — |
+| put an account in the `docker` group | only ever `--docker-user`, and only that one account | `--docker-user NAME` |
+| reboot | tells you one is needed | `--reboot`, which still refuses if dkms has not built the module |
+
+### The nvidia driver is pinned
+
+Currently **`nvidia-driver-595-open` 595.84**, with **15 packages held**. That
+pin is enforced three ways over: `apt upgrade` skips held packages,
+`unattended-upgrades` skips them at 3am, and re-running this script does not
+touch them either.
+
+So the driver moves only when you say so, by one of exactly two commands:
+
+```bash
+# stay on this branch, take a newer point release when Ubuntu ships one
+./provision-ubuntu-server.sh --only nvidia --reinstall
+
+# change branch — newer, or older
+NVIDIA_DRIVER_PKG=nvidia-driver-610-open ./provision-ubuntu-server.sh --only nvidia
+NVIDIA_DRIVER_PKG=nvidia-driver-590-open ./provision-ubuntu-server.sh --only nvidia
+```
+
+Both unhold, install, and re-hold in one run, so the box is never left unheld.
+Branches available in the configured repos: **570, 575, 580, 590, 595, 610**,
+each in `-open` and proprietary form. Blackwell needs `-open`; the proprietary
+modules do not support these cards.
+
+A driver change needs a **reboot** before the new module is loaded. Until then
+`nvidia-smi` reports a version mismatch and containers cannot see the GPUs, so
+do it in a window where that is acceptable — not while a model is serving. The
+script will not reboot unless you pass `--reboot`, and refuses even then if dkms
+has not built the module for the running kernel.
+
+What it does *not* currently support is pinning an exact point release within a
+branch (`=595.84-0ubuntu0.24.04.1`). It has not mattered: apt takes the branch's
+candidate, and the hold already freezes you wherever you are.
+
+### Recipes
+
+| to change | do this | what a later plain re-run does |
+|---|---|---|
+| driver branch | `NVIDIA_DRIVER_PKG=nvidia-driver-610-open … --only nvidia` | keeps 610, held; does not revert |
+| driver point release | `--only nvidia --reinstall` | keeps it, held |
+| hostname | `--hostname NAME --only hostname` | leaves it alone |
+| grow `/` into free VG space | `--only lvm` and answer yes | offers again if space remains; declining is free |
+| add a system package | add a line to `SYSTEM_PACKAGES`, re-run | installs only what is missing |
+| upgrade docker itself | `--only docker --reinstall` | keeps it, does not upgrade |
+| docker image store | `--data-root /srv/docker --only docker` | adopts whatever is configured |
+| container shm / log rotation | edit `DOCKER_SHM_SIZE`, re-run `--only docker` | rewrites `daemon.json` only if it differs |
+| GPU power cap | `--gpu-cap 500 --only gpustate` | keeps the unit as-is |
+| docker for a new account | `--rootless-accounts NAME --only rootless` | reports already-present |
+| raise memlock for an account | `--memlock-accounts "a b" --only limits` | rewrites only if the list changed |
+| re-login to tailscale | `--only tailscale` and answer yes | skips, reports the tailnet IP |
+
+`--reinstall` answers "yes, update" to *every* already-present component at once.
+It is the blunt instrument: on this box it would also update docker and the
+container toolkit. Prefer `--only STEP --reinstall` when you mean one thing.
+
 ## The nvidia driver is held on purpose
 
 `nvidia-driver-595-open`'s dependencies are **unversioned**, so holding the
