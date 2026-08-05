@@ -1390,7 +1390,11 @@ if want docker && (( DO_DOCKER )); then
     fi
   fi
 
-  run $SUDO systemctl enable --now docker
+  if systemctl is-enabled docker >/dev/null 2>&1 && systemctl is-active docker >/dev/null 2>&1; then
+    skip "docker is enabled and running"
+  else
+    run $SUDO systemctl enable --now docker
+  fi
 
   if [[ -n "${DOCKER_NEEDS_RESTART:-}" ]]; then
     if [[ -n "$($SUDO docker ps -q 2>/dev/null)" ]]; then
@@ -1508,7 +1512,7 @@ if want rootless && [[ -n "$ROOTLESS_ACCOUNTS" ]]; then
   done
   ROOTLESS_READY="$ROOTLESS_ACCOUNTS"
 elif want rootless; then
-  skip "no --rootless-accounts given; no per-account rootless prerequisites to install"
+  skip "no accounts named for rootless docker; nothing to prepare"
 fi
 
 # --------------------------------------------------------------- 10. gpustate --
@@ -1519,21 +1523,35 @@ if want gpustate && [[ -z "${SKIP_GPUSTATE:-}" ]]; then
   _unit="$TMPD/$GPU_STATE_UNIT.service"
   sed "s|__CAP_LINE__|$_cap_line|" "$TEMPLATES/gpu-state.service" >"$_unit"
 
+  _gs_changed=0
   if cmp -s "$_unit" "/etc/systemd/system/$GPU_STATE_UNIT.service" && (( ! FORCE_GPUSTATE )); then
     skip "$GPU_STATE_UNIT.service already current"
   else
+    _gs_changed=1
     list_replace "/etc/systemd/system/$GPU_STATE_UNIT.service"
     backup "/etc/systemd/system/$GPU_STATE_UNIT.service"
     log "installing /etc/systemd/system/$GPU_STATE_UNIT.service (cap: ${GPU_POWER_CAP:-none})"
     run $SUDO install -D -m 0644 -o root -g root "$_unit" "/etc/systemd/system/$GPU_STATE_UNIT.service"
     run $SUDO systemctl daemon-reload
   fi
-  run $SUDO systemctl enable "$GPU_STATE_UNIT.service"
+  if systemctl is-enabled "$GPU_STATE_UNIT.service" >/dev/null 2>&1; then
+    skip "$GPU_STATE_UNIT.service already enabled"
+  else
+    run $SUDO systemctl enable "$GPU_STATE_UNIT.service"
+  fi
 
-  # Enable always; start only with a live driver. Starting it now would leave a
-  # failed unit on a box that is otherwise fine.
+  # Start only with a live driver -- starting it without one leaves a failed
+  # unit on a box that is otherwise fine. And RESTART only when the unit
+  # actually changed: bouncing it after you answered "keep it" is an action
+  # taken against the answer you gave.
   if gpu_ready; then
-    run $SUDO systemctl restart "$GPU_STATE_UNIT.service"
+    if (( _gs_changed )); then
+      run $SUDO systemctl restart "$GPU_STATE_UNIT.service"
+    elif systemctl is-active "$GPU_STATE_UNIT.service" >/dev/null 2>&1; then
+      skip "$GPU_STATE_UNIT.service already active; not restarting"
+    else
+      run $SUDO systemctl start "$GPU_STATE_UNIT.service"
+    fi
   else
     defer "start $GPU_STATE_UNIT.service (persistence mode) -- needs a live driver"
   fi
