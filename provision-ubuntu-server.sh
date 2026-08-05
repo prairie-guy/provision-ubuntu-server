@@ -316,9 +316,16 @@ apt_upgrade_pkgs() {
 
 # ------------------------------------------------------------------- args --
 
+# `doctor` is a subcommand, not a flag: it does something different from
+# provisioning -- it reports on the box and offers to fix what it finds -- and a
+# separate word says that more clearly than a flag alongside the others.
+DOCTOR=0; HELP=0
+if [[ "${1:-}" == doctor ]]; then DOCTOR=1; shift; fi
+
 while (( $# )); do
   case "$1" in
-    --check)       CHECK_ONLY=1; shift ;;
+    --dry-run)     CHECK_ONLY=1; shift ;;
+    --check)       CHECK_ONLY=1; shift ;;   # old name for --dry-run; still works
     --reinstall)   FORCE=1; shift ;;
     --docker)      DO_DOCKER=1; shift ;;
     --nvctk)       DO_NVCTK=1; DO_DOCKER=1; shift ;;
@@ -339,7 +346,7 @@ while (( $# )); do
     --reserve=*)   GROW_RESERVE="${1#*=}"; shift ;;
     --only)        ONLY="${2:?--only needs a comma-separated step list}"; shift 2 ;;
     --only=*)      ONLY="${1#*=}"; shift ;;
-    -h|--help)     sed -n '2,40p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help)     HELP=1; shift ;;
     *) die "unknown argument: $1 (try --help)" ;;
   esac
 done
@@ -398,14 +405,19 @@ else
   SUDO="sudo"
 fi
 
-(( CHECK_ONLY )) && warn "DRY RUN -- nothing will be changed."
-log "host=$(hostname) user=${USER:-$(id -un)} kernel=$(uname -r)"
+if (( ! HELP )); then
+  (( CHECK_ONLY )) && warn "DRY RUN -- nothing will be changed."
+  log "host=$(hostname) user=${USER:-$(id -un)} kernel=$(uname -r)"
+fi
 
 # Prime sudo BEFORE the questions: lvs/vgs need root, so the LVM question
 # cannot even be composed without it. Keep the credential warm afterwards --
 # sudo's cache is 15 minutes and a full run outlasts it, which would otherwise
 # stop for a password long after you walked away.
-if [[ -n "$SUDO" ]]; then
+# --help only reads; doctor only reads until you accept a fix, and its fixes
+# prompt for their own sudo when you say yes. Neither should demand a password
+# up front -- that would make looking at the box more intrusive than it is.
+if [[ -n "$SUDO" ]] && (( ! HELP && ! DOCTOR )); then
   if (( CHECK_ONLY )); then
     # Do not prompt during a dry run; degrade gracefully instead.
     sudo -n true 2>/dev/null || warn "--check has no cached sudo: LVM state cannot be read, that step will report unknown"
@@ -429,7 +441,19 @@ nvidia_running_version() {
   awk '/NVRM version/ {for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+/) {print $i; exit}}' \
       /proc/driver/nvidia/version
 }
-nvidia_dkms_ok() { dkms status -m nvidia 2>/dev/null | grep -q ", $(uname -r), .*: installed"; }
+# No pipeline: `dkms status | grep -q` looks correct and is not. grep -q exits at
+# the first match, dkms takes SIGPIPE writing the next line, and `set -o pipefail`
+# turns that into a failed pipeline -- so this returned FALSE on a box where the
+# module was built fine. That made --reboot refuse to reboot, and made the nvidia
+# step warn that dkms had failed when it had not.
+nvidia_dkms_ok() {
+  local line kver
+  kver="$(uname -r)"
+  while IFS= read -r line; do
+    if [[ "$line" == *", $kver, "*": installed" ]]; then return 0; fi
+  done < <(dkms status -m nvidia 2>/dev/null)
+  return 1
+}
 
 # The kernel module is only loaded at boot. Installing the package builds it via
 # dkms but does NOT load it, and on an upgrade the OLD module stays resident
@@ -470,6 +494,33 @@ has_subid()  { grep -q "^$1:" "$2" 2>/dev/null; }
 # group" here would silently skip the revocation, which is the security-relevant
 # half of the whole step.
 in_docker_group() { [[ " $(id -nG "$1" 2>/dev/null) " == *" docker "* ]]; }
+
+# Installed vs available, so a question can say whether there is ACTUALLY
+# anything to update instead of asking "update it?" about a current package.
+# Both read apt's cached metadata -- no network, so this is cheap enough to run
+# during the questions. Cached means possibly stale; `doctor` reports the age.
+pkg_installed_ver() { dpkg-query -W -f='${Version}' "$1" 2>/dev/null || true; }
+pkg_candidate_ver() { apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/{print $2}'; }
+# True only when a NEWER version exists. Same version, no candidate, or a
+# downgrade all count as "nothing to do".
+pkg_upgradable() {
+  local i c
+  i="$(pkg_installed_ver "$1")"; [[ -n "$i" ]] || return 1
+  c="$(pkg_candidate_ver "$1")"; [[ -n "$c" && "$c" != "(none)" ]] || return 1
+  dpkg --compare-versions "$c" gt "$i"
+}
+# How stale apt's package lists are, in days. A candidate version read from
+# metadata last refreshed a month ago is not evidence that nothing is available.
+apt_meta_age_days() {
+  local newest
+  newest="$(find /var/lib/apt/lists -maxdepth 1 -name '*_Packages*' -printf '%T@\n' 2>/dev/null | sort -n | tail -1)"
+  [[ -n "$newest" ]] || { printf '999'; return 0; }
+  printf '%d' "$(( ( $(date +%s) - ${newest%.*} ) / 86400 ))"
+}
+
+# Exists in the configured repos at all -- checked before offering to switch to
+# a driver branch, so a typo fails at the question rather than mid-apt.
+have_pkg_available() { [[ -n "$(pkg_candidate_ver "$1")" && "$(pkg_candidate_ver "$1")" != "(none)" ]]; }
 
 have_docker()   { have_pkg docker-ce; }
 have_nvctk()    { have_pkg nvidia-container-toolkit; }
@@ -526,6 +577,251 @@ lvm_probe() {
   LVM_OK=1
 }
 
+# -------------------------------------------------------------------- help --
+
+# Deliberately verbose, and it reports LIVE state rather than only static text.
+# These commands change a machine that may be serving models, so --help should
+# answer "what would this actually do to THIS box right now", not just list
+# flags. In particular it names what has an update waiting, so you never have to
+# start a run to find out whether there is anything to do.
+if (( HELP )); then
+  sed -n '2,40p' "$0" | sed 's/^# \?//'
+  printf '\033[1mSTATE OF THIS BOX\033[0m\n\n'
+  printf '  apt package lists: %sd old\n' "$(apt_meta_age_days)"
+
+  if have_pkg "$NVIDIA_DRIVER_PKG"; then
+    printf '  nvidia driver:     %s %s (%s packages held)\n' \
+      "$NVIDIA_DRIVER_PKG" "$(nvidia_pkg_version)" \
+      "$(apt-mark showhold 2>/dev/null | grep -cE '^(nvidia-|libnvidia-)' || true)"
+    if pkg_upgradable "$NVIDIA_DRIVER_PKG"; then
+      printf '                     \033[1m%s is available\033[0m -- held, so NOT automatic\n' \
+        "$(pkg_candidate_ver "$NVIDIA_DRIVER_PKG")"
+    fi
+  else
+    printf '  nvidia driver:     not installed\n'
+  fi
+
+  # One line per component that apt can move, so "is there anything to update?"
+  # is answered here rather than by starting a run.
+  printf '\n  \033[1mupdates available\033[0m (these are what a run would offer):\n'
+  _any_upd=0
+  for _p in docker-ce nvidia-container-toolkit tailscale mosh; do
+    if have_pkg "$_p"; then
+      if pkg_upgradable "$_p"; then
+        printf '    %-28s %s -> \033[1m%s\033[0m\n' "$_p" "$(pkg_installed_ver "$_p")" "$(pkg_candidate_ver "$_p")"
+        _any_upd=1
+      fi
+    fi
+  done
+  _sysupd="$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst' || true)"
+  if (( _sysupd )); then
+    printf '    %-28s %s package(s)\n' "system packages (apt)" "$_sysupd"; _any_upd=1
+  fi
+  (( _any_upd )) || printf '    nothing -- every managed component is current\n'
+
+  printf '\n  \033[1msteps\033[0m: %s\n' "${VALID_STEPS[*]}"
+  printf '\n  \033[1mdoctor\033[0m checks this box and offers to fix what it finds:\n'
+  printf '      ./provision-ubuntu-server.sh doctor\n\n'
+  exit 0
+fi
+
+# ------------------------------------------------------------------ doctor --
+
+# Reports on the box, then offers to fix what it can. Read-only until you say
+# yes: every check runs first and the whole report prints, so you see the full
+# picture before deciding anything.
+#
+# A problem that CANNOT be fixed from here is still reported, with the command
+# that would fix it. Staying silent about a finding because there is no button
+# for it is worse than showing it.
+DOC_OK=0; DOC_WARN=0; DOC_FAIL=0
+DOC_FIX_DESC=(); DOC_FIX_CMD=()
+doc_ok()   { printf '  \033[1;32mOK\033[0m    %s\n' "$*"; DOC_OK=$((DOC_OK+1)); }
+doc_warn() { printf '  \033[1;33mWARN\033[0m  %s\n' "$*"; DOC_WARN=$((DOC_WARN+1)); }
+doc_fail() { printf '  \033[1;31mFAIL\033[0m  %s\n' "$*"; DOC_FAIL=$((DOC_FAIL+1)); }
+doc_note() { printf '        \033[2m%s\033[0m\n' "$*"; }
+# Queue a fix for the end. An EMPTY description means "reportable, not fixable
+# from here" -- the command is printed for you to run yourself.
+doc_fix()  { DOC_FIX_DESC+=("$1"); DOC_FIX_CMD+=("$2"); }
+
+if (( DOCTOR )); then
+  printf '\n'
+  log "doctor: $(hostname) -- $(. /etc/os-release && printf '%s' "$PRETTY_NAME"), kernel $(uname -r)"
+  printf '\n'
+
+  # Everything below that says "current" is only as good as apt's metadata, so
+  # its age is reported first rather than quietly assumed to be fresh.
+  _age="$(apt_meta_age_days)"
+  if (( _age <= 7 )); then
+    doc_ok "apt package lists are ${_age}d old"
+  else
+    doc_warn "apt package lists are ${_age}d old -- 'available' versions may be stale"
+    doc_fix "refresh apt package lists" "$SUDO apt-get update"
+  fi
+
+  # --- nvidia: the driver moving unnoticed is the failure this box cares most
+  # --- about, so held, loaded and dkms are checked separately.
+  if have_pkg "$NVIDIA_DRIVER_PKG"; then
+    _nheld="$(apt-mark showhold 2>/dev/null | grep -cE '^(nvidia-|libnvidia-)' || true)"
+    if (( _nheld )); then
+      doc_ok "nvidia $(nvidia_pkg_version) held ($_nheld packages) -- apt cannot move it"
+    else
+      doc_fail "nvidia packages are NOT held"
+      doc_note "unattended-upgrades can move libnvidia-* under the loaded module,"
+      doc_note "detaching the GPUs from every running container"
+      doc_fix "hold the nvidia packages" "$SCRIPT_DIR/provision-ubuntu-server.sh --only nvidia"
+    fi
+    if gpu_ready; then
+      doc_ok "driver $(nvidia_running_version) loaded, $(nvidia-smi -L 2>/dev/null | wc -l) GPU(s) visible"
+    else
+      doc_fail "the nvidia module is not loaded ($(nvidia_running_version 2>/dev/null || echo none))"
+      doc_note "installed package is $(nvidia_pkg_version) -- a reboot is needed"
+      doc_fix "" "sudo reboot"
+    fi
+    if nvidia_dkms_ok; then
+      doc_ok "dkms has built the module for $(uname -r)"
+    else
+      doc_fail "dkms has NOT built the nvidia module for the running kernel"
+      doc_note "a kernel upgrade whose rebuild failed takes every GPU down at the next reboot"
+      doc_note "check: dkms status; cat /var/lib/dkms/nvidia/*/build/make.log"
+      doc_fix "" "sudo dkms autoinstall"
+    fi
+    if pkg_upgradable "$NVIDIA_DRIVER_PKG"; then
+      doc_note "note: $(pkg_candidate_ver "$NVIDIA_DRIVER_PKG") is available on this branch"
+      doc_note "the hold means it will NOT be taken automatically"
+    fi
+  else
+    doc_warn "$NVIDIA_DRIVER_PKG is not installed"
+  fi
+
+  if have_gpustate; then
+    if systemctl is-enabled "$GPU_STATE_UNIT.service" >/dev/null 2>&1; then
+      doc_ok "$GPU_STATE_UNIT.service enabled"
+    else
+      doc_fail "$GPU_STATE_UNIT.service is installed but not enabled"
+      doc_fix "enable $GPU_STATE_UNIT.service" "$SUDO systemctl enable --now $GPU_STATE_UNIT.service"
+    fi
+    if gpu_ready; then
+      _pm="$(nvidia-smi --query-gpu=persistence_mode --format=csv,noheader 2>/dev/null | sort -u | tr '\n' ' ')"
+      if [[ "$_pm" == *Enabled* && "$_pm" != *Disabled* ]]; then
+        doc_ok "persistence mode enabled on all GPUs"
+      else
+        doc_warn "persistence mode: $_pm"
+      fi
+    fi
+  elif gpu_ready; then
+    doc_warn "no $GPU_STATE_UNIT.service -- persistence mode is not set at boot"
+    doc_fix "install the GPU state unit" "$SCRIPT_DIR/provision-ubuntu-server.sh --only gpustate"
+  fi
+
+  # --- docker: unbounded logs fill / on a box running a long-lived server, and
+  # --- nothing surfaces it until it happens.
+  if have_docker; then
+    _droot="$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || $SUDO docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo 'unknown (needs docker access)')"
+    doc_ok "docker $(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1), data-root $_droot"
+    if [[ -f /etc/docker/daemon.json ]] && grep -q 'max-size' /etc/docker/daemon.json 2>/dev/null; then
+      doc_ok "docker log rotation configured"
+    else
+      doc_fail "docker has NO log rotation -- the json-file driver is unbounded"
+      doc_note "a long-running container writing progress lines will fill /"
+      doc_fix "write /etc/docker/daemon.json" "$SCRIPT_DIR/provision-ubuntu-server.sh --only docker"
+    fi
+    if pkg_upgradable docker-ce; then
+      doc_note "note: docker-ce $(pkg_candidate_ver docker-ce) is available"
+    fi
+    # The docker group is root-equivalent. Name who holds it rather than leaving
+    # it to be discovered.
+    _dgroup="$(getent group docker | cut -d: -f4)"
+    if [[ -n "$_dgroup" ]]; then
+      doc_warn "in the docker group, which is ROOT-EQUIVALENT: $_dgroup"
+      doc_note "a member can bind-mount / into a container and read every credential"
+    else
+      doc_ok "nobody is in the docker group"
+    fi
+  fi
+
+  # --- rootless accounts: each piece breaks separately, and each is invisible
+  # --- until a container fails to start.
+  _unreadable=""
+  while IFS=: read -r _u _x _uid _g _c _home _s; do
+    (( _uid >= 1000 && _uid < 65534 )) || continue
+    # Homes are 0750. Silently finding nothing in an unreadable home reads as
+    # "this account is fine", which is the one thing it must not mean.
+    if [[ ! -r "$_home" ]]; then _unreadable="$_unreadable $_u"; continue; fi
+    [[ -f "$_home/.config/systemd/user/docker.service" ]] || continue
+    doc_ok "$_u has a rootless docker daemon"
+    if has_subid "$_u" /etc/subuid && has_subid "$_u" /etc/subgid; then
+      : # ranges present, nothing to say
+    else
+      doc_fail "$_u has no subuid/subgid range -- its rootless daemon cannot start"
+      _s1="$(next_subid /etc/subuid)"; _s2="$(next_subid /etc/subgid)"
+      doc_fix "add a subordinate id range for $_u" \
+        "$SUDO usermod --add-subuids $_s1-$((_s1+SUBID_COUNT-1)) --add-subgids $_s2-$((_s2+SUBID_COUNT-1)) $_u"
+    fi
+    if [[ "$(loginctl show-user "$_u" -p Linger --value 2>/dev/null)" == yes ]]; then
+      doc_ok "$_u has linger enabled -- its daemon survives logout"
+    else
+      doc_fail "$_u has NO linger -- its daemon and containers die at its last logout"
+      doc_fix "enable linger for $_u" "$SUDO loginctl enable-linger $_u"
+    fi
+    if in_docker_group "$_u"; then
+      doc_fail "$_u is rootless AND in the root-equivalent docker group"
+      doc_note "the rootful socket stays reachable, so rootless buys nothing"
+      doc_fix "remove $_u from the docker group" "$SUDO gpasswd -d $_u docker"
+    fi
+    if [[ -f "$_home/.config/docker/daemon.json" ]]; then
+      doc_ok "$_u has its own daemon.json (log rotation, shm, memlock)"
+    else
+      doc_warn "$_u has no ~/.config/docker/daemon.json"
+      doc_note "a rootless daemon reads NOTHING from /etc/docker: no log rotation"
+      doc_note "(fills \$HOME), 64M shm, and the account's default memlock"
+      doc_fix "" "as $_u:  ./provision-ubuntu-account.sh --docker-rootless"
+    fi
+  done < <(getent passwd)
+  if [[ -n "$_unreadable" ]]; then
+    doc_warn "not inspected, home not readable as $(id -un):$_unreadable"
+    doc_note "their rootless docker, linger and daemon.json cannot be checked from here"
+    doc_note "for a full report:  sudo -v && ./provision-ubuntu-server.sh doctor"
+  fi
+
+  if have_tailscale; then
+    if ts_logged_in; then
+      doc_ok "tailscale up ($(tailscale ip -4 2>/dev/null | head -1))"
+    else
+      doc_warn "tailscale is installed but not logged in"
+      doc_fix "log in to tailscale" "$SUDO tailscale up"
+    fi
+  fi
+
+  if reboot_pending; then
+    doc_warn "a reboot is pending"
+    doc_fix "" "sudo reboot"
+  fi
+
+  printf '\n'
+  log "$DOC_OK ok, $DOC_WARN warning(s), $DOC_FAIL failure(s)"
+
+  # Offer each fix individually. Nothing above this point changed anything.
+  if (( ${#DOC_FIX_CMD[@]} )); then
+    printf '\n'
+    for _i in "${!DOC_FIX_CMD[@]}"; do
+      if [[ -z "${DOC_FIX_DESC[$_i]}" ]]; then
+        warn "not fixable from here:  ${DOC_FIX_CMD[$_i]}"
+        continue
+      fi
+      printf '\n  %s\n      \033[2m%s\033[0m\n' "${DOC_FIX_DESC[$_i]}" "${DOC_FIX_CMD[$_i]}"
+      if (( CHECK_ONLY )); then
+        printf '    \033[2m[dry run -- would offer this fix]\033[0m\n'
+      elif ask_yn "  run it?" n; then
+        eval "${DOC_FIX_CMD[$_i]}" || warn "that fix failed; the rest of the report still stands"
+      fi
+    done
+  fi
+  printf '\n'
+  (( DOC_FAIL )) && exit 1
+  exit 0
+fi
+
 # --------------------------------------------------------------- questions --
 #
 # One question per component, phrased by what is actually there: "install X?"
@@ -575,22 +871,70 @@ fi
 
 if want nvidia; then
   if have_pkg "$NVIDIA_DRIVER_PKG"; then
-    if (( ! FORCE_NVIDIA )) && ask_yn "$NVIDIA_DRIVER_PKG $(nvidia_pkg_version) is installed -- reinstall/update it?" n; then
+    # The driver is the one thing you would deliberately change the version of,
+    # so show the whole picture and let a branch be typed here rather than
+    # requiring NVIDIA_DRIVER_PKG to be set on the command line.
+    printf '\n'
+    log "nvidia driver"
+    printf '      installed:  %-28s %s\n' "$NVIDIA_DRIVER_PKG $(nvidia_pkg_version)" \
+      "$(apt-mark showhold 2>/dev/null | grep -cE '^(nvidia-|libnvidia-)' | sed 's/^/HELD, /;s/$/ packages/')"
+    if gpu_ready; then
+      printf '      loaded:     %-28s %s GPU(s)\n' "$(nvidia_running_version)" "$(nvidia-smi -L 2>/dev/null | wc -l)"
+    else
+      printf '      loaded:     %s\n' "$(nvidia_running_version 2>/dev/null || echo 'no module -- a reboot is needed')"
+    fi
+    # ERE, so [0-9]+ -- not [0-9]\+, which matches a literal plus and finds
+    # nothing. `|| true` because an empty result must not abort the run under
+    # `set -e`: not knowing the branch list is cosmetic, not fatal.
+    _branches="$(apt-cache search --names-only '^nvidia-driver-[0-9]+-open$' 2>/dev/null \
+                 | grep -oE '[0-9]+' | sort -nu | tr '\n' ' ' || true)"
+    [[ -n "$_branches" ]] && printf '      branches:   %s(-open)\n' "$_branches"
+    if pkg_upgradable "$NVIDIA_DRIVER_PKG"; then
+      printf '      available:  %s on this branch\n' "$(pkg_candidate_ver "$NVIDIA_DRIVER_PKG")"
+    else
+      printf '      available:  nothing newer on this branch\n'
+    fi
+    printf '      a change needs a REBOOT before the new module loads.\n'
+
+    _cur_branch="$(printf '%s' "$NVIDIA_DRIVER_PKG" | grep -oE '[0-9]+' | head -1)"
+    if [[ -t 0 ]]; then
+      read -r -p "keep $_cur_branch, or type a branch number to switch to [$_cur_branch]: " _reply || true
+    else
+      _reply=""
+    fi
+    _reply="${_reply:-$_cur_branch}"
+    if [[ "$_reply" != "$_cur_branch" ]]; then
+      [[ "$_reply" =~ ^[0-9]+$ ]] || die "not a branch number: '$_reply' (expected e.g. 610)"
+      have_pkg_available "nvidia-driver-$_reply-open" \
+        || die "nvidia-driver-$_reply-open is not in the configured apt repos.
+   Available: $_branches"
+      NVIDIA_DRIVER_PKG="nvidia-driver-$_reply-open"
+      log "switching to $NVIDIA_DRIVER_PKG (this unholds, installs, and re-holds)"
+      FORCE_NVIDIA=1
+    elif (( ! FORCE_NVIDIA )) && pkg_upgradable "$NVIDIA_DRIVER_PKG" \
+         && ask_yn "update to $(pkg_candidate_ver "$NVIDIA_DRIVER_PKG") on this branch?" n; then
       FORCE_NVIDIA=1
     fi
   fi
   # Holding matters because the metapackage's deps are UNVERSIONED, so an
   # unattended security update can move libnvidia-* underneath the loaded
   # module and detach the GPUs from a running inference server.
-  if ! apt-mark showhold 2>/dev/null | grep -q '^nvidia-'; then
+  if [[ -z "$(apt-mark showhold 2>/dev/null | grep '^nvidia-' || true)" ]]; then
     ask_yn "hold the nvidia packages so apt/unattended-upgrades cannot move them?" y && DO_HOLD_NVIDIA=1
   fi
 fi
 
 if want docker; then
   if have_docker; then
-    if (( ! FORCE_DOCKER )) && ask_yn "Docker $(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) is installed -- update it?" n; then
-      FORCE_DOCKER=1; DO_DOCKER=1
+    # Only ask when apt actually has something newer. "Docker 29.7.1 is
+    # installed -- update it?" on a current box is noise: there is nothing to
+    # update to, and answering yes does nothing but reinstall the same version.
+    if (( ! FORCE_DOCKER )) && pkg_upgradable docker-ce; then
+      if ask_yn "Docker $(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) is installed; $(pkg_candidate_ver docker-ce | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) is available -- update it?" n; then
+        FORCE_DOCKER=1; DO_DOCKER=1
+      fi
+    elif (( ! FORCE_DOCKER )); then
+      skip "Docker $(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) is installed and current"
     fi
     DO_DOCKER=1
   elif (( ! DO_DOCKER )); then
@@ -600,8 +944,12 @@ fi
 
 if want nvctk; then
   if have_nvctk; then
-    if (( ! FORCE_NVCTK )) && ask_yn "the NVIDIA Container Toolkit is installed -- update it?" n; then
-      FORCE_NVCTK=1; DO_NVCTK=1
+    if (( ! FORCE_NVCTK )) && pkg_upgradable nvidia-container-toolkit; then
+      if ask_yn "the NVIDIA Container Toolkit $(pkg_installed_ver nvidia-container-toolkit) is installed; $(pkg_candidate_ver nvidia-container-toolkit) is available -- update it?" n; then
+        FORCE_NVCTK=1; DO_NVCTK=1
+      fi
+    elif (( ! FORCE_NVCTK )); then
+      skip "NVIDIA Container Toolkit $(pkg_installed_ver nvidia-container-toolkit) is installed and current"
     fi
     DO_NVCTK=1
   elif (( ! DO_NVCTK )) && (( DO_DOCKER )); then
@@ -858,7 +1206,7 @@ if want nvidia; then
       log "holding ${#_held[@]} nvidia packages against apt upgrade"
       run $SUDO apt-mark hold "${_held[@]}"
     fi
-  elif apt-mark showhold 2>/dev/null | grep -q '^nvidia-'; then
+  elif [[ -n "$(apt-mark showhold 2>/dev/null | grep '^nvidia-' || true)" ]]; then
     skip "nvidia packages already held ($(apt-mark showhold | grep -c -E '^(nvidia-|libnvidia-)') packages)"
   fi
 fi
@@ -953,7 +1301,7 @@ if want docker && (( DO_DOCKER )); then
     fi
   fi
 
-  if id -nG "$DOCKER_GROUP_USER" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+  if in_docker_group "$DOCKER_GROUP_USER"; then
     skip "$DOCKER_GROUP_USER is already in the docker group"
   else
     log "adding $DOCKER_GROUP_USER to the docker group (root-equivalent access)"
