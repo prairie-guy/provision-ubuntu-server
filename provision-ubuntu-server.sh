@@ -12,6 +12,8 @@
 #   ./provision-ubuntu-server.sh --only nvidia    # run just these steps
 #   ./provision-ubuntu-server.sh --reinstall      # refresh what is already installed
 #   ./provision-ubuntu-server.sh --docker --nvctk # answer those questions up front
+#   ./provision-ubuntu-server.sh --rootless-accounts scratch   # docker for an
+#                                                 # account, without root
 #
 # Idempotent: safe to re-run. Every question is asked before any work starts, so
 # once you have answered them the run does not stop for input.
@@ -72,6 +74,24 @@ SYSTEM_HOSTNAME="${SYSTEM_HOSTNAME:-}"          # --hostname
 # it has to be raised here, at the system level, or CUDA pinned-memory and NCCL
 # allocations fail inside its containers. Empty = install nothing.
 MEMLOCK_ACCOUNTS="${MEMLOCK_ACCOUNTS:-}"        # --memlock-accounts "a b"
+
+# Accounts that will run `provision-ubuntu-account.sh --docker-rootless`.
+# That script runs AS the account and never calls sudo -- that contract is what
+# lets a non-sudo agent account provision itself completely -- so the parts of
+# rootless setup that genuinely need root have to be done HERE:
+#
+#   * uidmap + docker-ce-rootless-extras  (already in SYSTEM_PACKAGES and
+#                                          DOCKER_PACKAGES; nothing to add)
+#   * a /etc/subuid + /etc/subgid range   (adduser writes one, useradd does not)
+#   * loginctl enable-linger              (or the account's daemon, and every
+#                                          container under it, dies when its
+#                                          last session ends)
+#   * NOT being in the docker group       (root-equivalent, and the rootless
+#                                          setup tool refuses to run beside a
+#                                          writable /var/run/docker.sock)
+#
+# Empty = prompted for when docker is present, then skipped if left blank.
+ROOTLESS_ACCOUNTS="${ROOTLESS_ACCOUNTS:-}"      # --rootless-accounts "a b"
 
 # --- gpu --------------------------------------------------------------------
 # `ubuntu-drivers devices` reports this as `recommended` for these exact cards,
@@ -287,6 +307,8 @@ while (( $# )); do
     --hostname=*)  SYSTEM_HOSTNAME="${1#*=}"; HOSTNAME_EXPLICIT=1; shift ;;
     --memlock-accounts)   MEMLOCK_ACCOUNTS="${2:?--memlock-accounts needs a name or space-separated list}"; shift 2 ;;
     --memlock-accounts=*) MEMLOCK_ACCOUNTS="${1#*=}"; shift ;;
+    --rootless-accounts)   ROOTLESS_ACCOUNTS="${2:?--rootless-accounts needs a name or space-separated list}"; ROOTLESS_EXPLICIT=1; shift 2 ;;
+    --rootless-accounts=*) ROOTLESS_ACCOUNTS="${1#*=}"; ROOTLESS_EXPLICIT=1; shift ;;
     --gpu-cap)     GPU_POWER_CAP="${2:?--gpu-cap needs a wattage}"; shift 2 ;;
     --gpu-cap=*)   GPU_POWER_CAP="${1#*=}"; shift ;;
     --data-root)   DOCKER_DATA_ROOT="${2:?--data-root needs a path}"; shift 2 ;;
@@ -304,7 +326,7 @@ done
 
 # A step runs unless --only was given and does not name it. Unknown names are
 # rejected: a typo would otherwise run nothing and exit 0, looking successful.
-VALID_STEPS=(hostname limits lvm apt packages tailscale mosh nvidia docker nvctk gpustate)
+VALID_STEPS=(hostname limits lvm apt packages tailscale mosh nvidia docker nvctk rootless gpustate)
 if [[ -n "$ONLY" ]]; then
   IFS=, read -r -a _requested <<<"$ONLY"
   for _s in "${_requested[@]}"; do
@@ -317,6 +339,17 @@ want() { [[ -z "$ONLY" ]] || [[ ",$ONLY," == *",$1,"* ]]; }
 # Default to the current name so pressing Enter keeps it.
 [[ -n "${HOSTNAME_EXPLICIT:-}" ]] || HOSTNAME_EXPLICIT=0
 [[ -n "$SYSTEM_HOSTNAME" ]] || SYSTEM_HOSTNAME="$(hostname)"
+
+[[ -n "${ROOTLESS_EXPLICIT:-}" ]] || ROOTLESS_EXPLICIT=0
+
+# Validated here rather than in the step: a typo'd account name should stop the
+# run before anything has been changed, not after ten minutes of apt.
+for _a in $ROOTLESS_ACCOUNTS; do
+  [[ "$_a" =~ ^[a-z_][a-z0-9_-]*$ ]] \
+    || die "invalid --rootless-accounts entry '$_a': not a valid account name"
+  getent passwd "$_a" >/dev/null || die "no such account: $_a
+   Create it first:  sudo adduser $_a"
+done
 
 # GPU_POWER_CAP lands in a sed replacement and in an ExecStart line; a stray | or
 # a non-numeric value would corrupt the unit or fail at every boot.
@@ -394,6 +427,29 @@ reboot_pending() {
   have_pkg "$NVIDIA_DRIVER_PKG" && ! gpu_ready && return 0
   return 1
 }
+
+# Subordinate uid/gid ranges, for the rootless step. adduser allocates one per
+# account; this only has to cover accounts made with plain useradd, or made
+# before subids were a thing. The next free block is SCANNED rather than
+# hardcoded to 100000: two accounts sharing a range means one account's
+# containers can write files owned by the other's.
+SUBID_COUNT="$(awk '$1=="SUB_UID_COUNT"{print $2}' /etc/login.defs 2>/dev/null | tail -1)"
+[[ "$SUBID_COUNT" =~ ^[0-9]+$ ]] || SUBID_COUNT=65536
+next_subid() {
+  local f="$1" name start count max=100000
+  [[ -f "$f" ]] || { printf '%s' "$max"; return 0; }
+  while IFS=: read -r name start count; do
+    [[ "$start" =~ ^[0-9]+$ && "$count" =~ ^[0-9]+$ ]] || continue
+    if (( start + count > max )); then max=$(( start + count )); fi
+  done <"$f"
+  printf '%s' "$max"
+}
+has_subid()  { grep -q "^$1:" "$2" 2>/dev/null; }
+# No pipeline: under `set -o pipefail`, `id -nG | grep -q` can report failure
+# when grep exits early and the writer takes SIGPIPE. A false "not in the docker
+# group" here would silently skip the revocation, which is the security-relevant
+# half of the whole step.
+in_docker_group() { [[ " $(id -nG "$1" 2>/dev/null) " == *" docker "* ]]; }
 
 have_docker()   { have_pkg docker-ce; }
 have_nvctk()    { have_pkg nvidia-container-toolkit; }
@@ -530,6 +586,60 @@ if want nvctk; then
     DO_NVCTK=1
   elif (( ! DO_NVCTK )) && (( DO_DOCKER )); then
     ask_yn "install the NVIDIA Container Toolkit so containers can use the GPUs?" y && { DO_NVCTK=1; DO_DOCKER=1; }
+  fi
+fi
+
+# Asked only when there will be a docker to be rootless ABOUT, and only when a
+# terminal is there to answer: an unattended run leaves the list empty and the
+# step skips. Free text rather than yes/no because the answer is a set of
+# accounts, and naming them is the whole decision -- rootless is per-account and
+# granting it to one account grants nothing to the next.
+DO_REVOKE_DOCKER=0
+NEED_RELOGIN=""
+ROOTLESS_READY=""
+if want rootless && (( ! ROOTLESS_EXPLICIT )) && [[ -z "$ROOTLESS_ACCOUNTS" ]] \
+   && { (( DO_DOCKER )) || have_docker; } && [[ -t 0 ]]; then
+  _cands=""
+  while IFS=: read -r _u _x _uid _g _c _home _s; do
+    (( _uid >= 1000 && _uid < 65534 )) && [[ "$_home" == /home/* ]] && _cands="$_cands $_u"
+  done < <(getent passwd)
+  printf '\n'
+  log "rootless docker lets an account run containers WITHOUT the docker group,"
+  printf '      which is root-equivalent. This installs the root-only half:\n'
+  printf '      subuid/subgid ranges, linger, and removal from the docker group.\n'
+  printf '      The account itself then runs: provision-ubuntu-account.sh --docker-rootless\n'
+  read -r -p "accounts to prepare for rootless docker (space-separated, empty for none)${_cands:+ [candidates:$_cands]}: " _reply || true
+  ROOTLESS_ACCOUNTS="${_reply:-}"
+  for _a in $ROOTLESS_ACCOUNTS; do
+    [[ "$_a" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "invalid account name '$_a'"
+    getent passwd "$_a" >/dev/null || die "no such account: $_a (create it: sudo adduser $_a)"
+  done
+fi
+
+# The revocation is the security-relevant half, so it is asked, not assumed --
+# but it defaults to YES, because leaving the account in the group makes the
+# rest of this step pointless and the account's own setup tool will refuse to
+# run anyway.
+if want rootless && [[ -n "$ROOTLESS_ACCOUNTS" ]]; then
+  _in_group=""
+  for _a in $ROOTLESS_ACCOUNTS; do
+    in_docker_group "$_a" && _in_group="$_in_group $_a"
+  done
+  # Adding an account to the docker group and revoking it in the same run is a
+  # contradiction, not a preference -- and the docker step runs first, so the
+  # account would end up rootless AND root-equivalent.
+  for _a in $ROOTLESS_ACCOUNTS; do
+    want docker && (( DO_DOCKER )) && [[ "$_a" == "$DOCKER_GROUP_USER" ]] \
+      && die "$_a is both --docker-user (added to the root-equivalent docker
+   group) and --rootless-accounts (which exists to keep it out). Pick one:
+     --docker-user NAME       for a human admin
+     --rootless-accounts NAME for an agent or untrusted worker"
+  done
+  if [[ -n "$_in_group" ]]; then
+    warn "in the docker group, which is ROOT-EQUIVALENT --$_in_group"
+    warn "  a member runs:  docker run -v /:/host -it ubuntu chroot /host"
+    warn "  and reads /etc/shadow, every ssh key and every stored credential."
+    ask_yn "remove$_in_group from the docker group?" y && DO_REVOKE_DOCKER=1
   fi
 fi
 
@@ -861,7 +971,78 @@ if want nvctk && (( DO_NVCTK )); then
   fi
 fi
 
-# --------------------------------------------------------------- 9. gpustate --
+# --------------------------------------------------------------- 9. rootless --
+
+# The root-only half of rootless docker, so that provision-ubuntu-account.sh can
+# stay sudo-free. Runs AFTER the docker step, which is what installs
+# docker-ce-rootless-extras. Nothing here starts a daemon: the daemon belongs to
+# the account and is created by the account's own run.
+if want rootless && [[ -n "$ROOTLESS_ACCOUNTS" ]]; then
+  # Both come from earlier steps -- uidmap from packages, rootless-extras from
+  # docker -- so a gap here means one of those was skipped, not that the list is
+  # wrong. Say which, rather than letting the account discover it later.
+  _rl_missing=()
+  have_pkg uidmap || _rl_missing+=(uidmap)
+  have_pkg docker-ce-rootless-extras || _rl_missing+=(docker-ce-rootless-extras)
+  if (( ${#_rl_missing[@]} )); then
+    warn "rootless needs ${_rl_missing[*]}, which this run has not installed."
+    warn "  uidmap comes from the packages step, docker-ce-rootless-extras from"
+    warn "  the docker step. Re-run including them:"
+    warn "      ./provision-ubuntu-server.sh --docker --rootless-accounts \"$ROOTLESS_ACCOUNTS\""
+  fi
+
+  for _a in $ROOTLESS_ACCOUNTS; do
+    log "rootless prerequisites for $_a"
+
+    # 1. A subordinate uid/gid range, or there are no uids to map into the
+    #    account's user namespace and the daemon cannot start at all.
+    for _kind in uid gid; do
+      _f="/etc/sub$_kind"
+      if has_subid "$_a" "$_f"; then
+        skip "  $_f range already present"
+      else
+        _start="$(next_subid "$_f")"
+        _range="$_start-$(( _start + SUBID_COUNT - 1 ))"
+        log "  adding $_f range $_range"
+        if [[ "$_kind" == uid ]]; then
+          run $SUDO usermod --add-subuids "$_range" "$_a"
+        else
+          run $SUDO usermod --add-subgids "$_range" "$_a"
+        fi
+      fi
+    done
+
+    # 2. Linger, or systemd tears the user manager down with the last session --
+    #    taking the account's docker daemon and every container with it. For an
+    #    agent account that is every logout, i.e. constantly.
+    if [[ "$(loginctl show-user "$_a" -p Linger --value 2>/dev/null)" == yes ]]; then
+      skip "  linger already enabled"
+    else
+      log "  enabling linger (its daemon outlives its sessions)"
+      run $SUDO loginctl enable-linger "$_a"
+    fi
+
+    # 3. The docker group, which must NOT be held. Asked about up front; when
+    #    declined, say plainly that the account's own run will fail, because
+    #    dockerd-rootless-setuptool.sh aborts while /var/run/docker.sock is
+    #    writable.
+    if ! in_docker_group "$_a"; then
+      skip "  not in the docker group"
+    elif (( DO_REVOKE_DOCKER )); then
+      log "  removing $_a from the docker group (root-equivalent)"
+      run $SUDO gpasswd -d "$_a" docker
+      NEED_RELOGIN="$NEED_RELOGIN $_a"
+    else
+      warn "  $_a keeps the ROOT-EQUIVALENT docker group, so rootless setup will"
+      warn "  refuse to run for it. Undo later with:  sudo gpasswd -d $_a docker"
+    fi
+  done
+  ROOTLESS_READY="$ROOTLESS_ACCOUNTS"
+elif want rootless; then
+  skip "no --rootless-accounts given; no per-account rootless prerequisites to install"
+fi
+
+# --------------------------------------------------------------- 10. gpustate --
 
 if want gpustate && [[ -z "${SKIP_GPUSTATE:-}" ]]; then
   _cap_line=""
@@ -943,6 +1124,19 @@ if gpu_ready; then
   echo
   log "GPUs: $(nvidia-smi -L 2>/dev/null | wc -l), persistence $(nvidia-smi --query-gpu=persistence_mode --format=csv,noheader 2>/dev/null | head -1), cap ${GPU_POWER_CAP:-stock}"
   log "live changes: gpu-power (from the account repo);  persistent: GPU_POWER_CAP + --only gpustate"
+fi
+
+if [[ -n "$ROOTLESS_READY" ]]; then
+  echo
+  log "rootless docker prerequisites installed for:$ROOTLESS_READY"
+  log "the rest is per-account and needs NO root. As each account:"
+  echo "    ./provision-ubuntu-account.sh --docker-rootless"
+  log "which installs its own daemon, its own daemon.json (a rootless daemon"
+  log "reads nothing from /etc/docker) and its own nvidia no-cgroups config."
+  [[ -n "$NEED_RELOGIN" ]] && \
+    warn "removed from the docker group:$NEED_RELOGIN -- each must log out and back"
+  [[ -n "$NEED_RELOGIN" ]] && \
+    warn "in before that takes effect (groups are fixed at login)."
 fi
 
 echo

@@ -36,6 +36,11 @@ answered them you can walk away.
 10. ./provision-ubuntu-account.sh          # no sudo needed
 ```
 
+For an account that needs **docker without root** — an agent, or any untrusted
+worker — add `--rootless-accounts scratch` at step 4 (or re-run later with
+`--only rootless`) and `--docker-rootless` at step 10. See
+[Docker for an ordinary account](#docker-for-an-ordinary-account-rootless).
+
 ## Steps
 
 | step | what | default |
@@ -49,6 +54,7 @@ answered them you can walk away.
 | `nvidia` | driver + nvtop, then hold against apt | asks |
 | `docker` | Docker's own apt repo, system daemon, `docker` group | asks, **no** |
 | `nvctk` | NVIDIA Container Toolkit + `daemon.json` | asks, implies docker |
+| `rootless` | the root-only prerequisites so named accounts can run docker *without* the docker group | asks when docker is present |
 | `gpustate` | systemd unit for GPU persistence mode | asks, **yes** |
 
 `--only lvm,apt` runs a subset. Unknown step names are rejected rather than
@@ -65,7 +71,8 @@ silently doing nothing.
 | `--docker`, `--nvctk` | answer those questions up front |
 | `--gpu-cap W` | per-GPU power cap for the systemd unit |
 | `--data-root PATH` | where docker keeps images |
-| `--docker-user NAME` | who gets added to the `docker` group |
+| `--docker-user NAME` | who gets added to the `docker` group (root-equivalent — a human admin) |
+| `--rootless-accounts "a b"` | who gets the root-only half of rootless docker instead (an agent, or any untrusted worker) |
 | `--reserve SIZE` | leave this much of the VG unallocated for snapshots (default 100G) |
 | `--reboot` | reboot when finished, if the driver needs it |
 
@@ -156,6 +163,63 @@ it only when there is a genuinely separate filesystem:
 Changing it after images exist is **detected and refused**, not migrated — an
 interrupted copy, or one that loses hardlinks or xattrs, corrupts the overlay2
 store silently. The script prints the correct `rsync -aHAX` recipe instead.
+
+### Docker for an ordinary account (`rootless`)
+
+Docker is **root-only out of the box**: `/var/run/docker.sock` is `root:docker`,
+so a new account gets `permission denied` and nothing else. There is no "all
+accounts can use docker" state. Installing docker grants nothing to anyone;
+access is a separate, per-account decision with exactly two answers:
+
+| | grants | suitable for |
+|---|---|---|
+| `--docker-user NAME` → `usermod -aG docker` | **root-equivalent** | a human admin |
+| `--rootless-accounts "NAME"` | containers only, as that account | an agent, or any untrusted worker |
+
+The group is root-equivalent because a member can run
+
+```bash
+docker run -v /:/host -it ubuntu chroot /host
+```
+
+which is a root shell — `/etc/shadow`, every ssh key, every stored credential,
+sudoers. No password, no exploit; it is what the socket does. An account in that
+group is not a restricted worker, it is root that happens not to have `sudo`.
+
+Naming an account in **both** flags is refused, not resolved.
+
+This step does only the parts that need root, because `provision-ubuntu-account.sh`
+runs as the account and never calls sudo — that contract is what lets a non-sudo
+agent account provision itself completely:
+
+* a `/etc/subuid` + `/etc/subgid` range — `adduser` allocates one, plain
+  `useradd` does not, and without it there are no uids to map into the
+  account's namespace. The next free block is scanned, not hardcoded, so two
+  accounts can never share a range
+* `loginctl enable-linger` — without it systemd tears down the user manager
+  when the account's last session ends, taking its docker daemon and every
+  running container with it
+* removal from the `docker` group, asked and defaulting to yes — rootless is
+  pointless while it holds, and `dockerd-rootless-setuptool.sh` refuses to run
+  while `/var/run/docker.sock` is writable anyway
+
+The packages (`uidmap`, `docker-ce-rootless-extras`) already come from the
+`packages` and `docker` steps.
+
+Everything after that belongs to the account and needs no root:
+
+```bash
+sudo adduser scratch
+./provision-ubuntu-server.sh --docker --rootless-accounts scratch
+sudo su - scratch
+./provision-ubuntu-account.sh --docker-rootless
+```
+
+which gives that account its own daemon, its own image store in
+`~/.local/share/docker`, its own `~/.config/docker/daemon.json` (a rootless
+daemon reads *nothing* from `/etc/docker`), and the `no-cgroups` nvidia config
+that GPU containers need under rootless. Provisioning one account grants
+nothing to the next.
 
 ### `--gpus all` is broken on Docker 29.x
 
