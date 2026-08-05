@@ -18,8 +18,47 @@ cd ~/stuff/provision-ubuntu-server
 Run it **as yourself**, not `sudo bash` — it calls `sudo` itself, once, and
 keeps the credential warm so a long run never stops for a password.
 
-Idempotent. Every question is asked **before any work starts**, so once you've
-answered them you can walk away.
+## Run it with no flags
+
+**That is the intended way to use this, and it is what you want in almost every
+case.** With no arguments the script does two things, in order:
+
+1. **Asks.** It works out what is already on the box and asks a plain question
+   about each thing it could do — phrased by what it found, so `install docker?`
+   on a fresh box and `Docker 29.7.1 is installed -- update it?` on this one.
+   Every question comes **first**, before any work at all.
+2. **Executes.** Once you have answered, it runs to completion without stopping.
+   Sudo is primed during the questions and kept warm, so even a driver install
+   and a full `apt upgrade` never pause for a password.
+
+Answer everything with Enter and you get the conservative choice: it installs
+what is missing and leaves alone what is already there.
+
+Nothing below this point is required reading. **The flags are not the
+interface** — they exist so a *second* box, a cron job, or a re-run can skip the
+questions by answering them up front. Reach for them when you are repeating a
+decision you have already made, not when you are making it.
+
+The one exception worth knowing: run `--check` first on a box that matters. It
+asks the same questions, then prints what it *would* do instead of doing it.
+
+### Where the settings live
+
+Two tiers, and they answer different kinds of question:
+
+| | holds | how you change it |
+|---|---|---|
+| **the questions** | *what should happen* — install docker or not, hold the driver or not, grow the root volume or not | answer them at the prompt |
+| **the `CONFIGURATION` block** at the top of the script | *what values to use* — which driver branch, how much shm, where docker keeps images, how much VG space to reserve | edit those lines once for the box |
+
+So a value like `NVIDIA_DRIVER_PKG=nvidia-driver-595-open` is not something you
+are asked about on every run — it is a property of this machine, recorded in the
+script with a comment saying why. Change it there and it stays changed. Each of
+those lines also has a matching flag, for the runs where you want to override it
+without editing anything.
+
+Idempotent. Re-running is safe and is how you change things later — see
+[Re-running is safe](#re-running-is-safe-and-is-how-you-change-things).
 
 ## Where this fits
 
@@ -61,6 +100,11 @@ worker — add `--rootless-accounts scratch` at step 4 (or re-run later with
 silently doing nothing.
 
 ## Options
+
+You do not need these for a normal run — the questions cover every decision.
+They are for answering a question up front (so an unattended or repeat run does
+not need you there), for overriding a `CONFIGURATION` value for one run, or for
+narrowing the run to one step.
 
 | flag | purpose |
 |---|---|
@@ -178,6 +222,11 @@ branch (`=595.84-0ubuntu0.24.04.1`). It has not mattered: apt takes the branch's
 candidate, and the hold already freezes you wherever you are.
 
 ### Recipes
+
+**The plain interactive run handles most of these** — re-run with no flags and
+answer the question about the thing you want to change. The commands below are
+the unattended equivalents: use them when you already know the answer, or when
+you want to touch exactly one step and nothing else.
 
 | to change | do this | what a later plain re-run does |
 |---|---|---|

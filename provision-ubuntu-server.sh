@@ -7,16 +7,31 @@
 # to install the system packages both of those need, so no per-account run ever
 # escalates to sudo.
 #
-#   ./provision-ubuntu-server.sh                  # ask about each component
-#   ./provision-ubuntu-server.sh --check          # dry run, change nothing
+# RUN IT WITH NO FLAGS. That is the intended way to use this:
+#
+#   ./provision-ubuntu-server.sh --check     # same questions, does nothing
+#   ./provision-ubuntu-server.sh             # <- this
+#
+# It asks a plain question about each thing it could do, phrased by what it
+# actually found on the box, and asks ALL of them before doing any work. Then it
+# runs to completion without stopping -- sudo is primed during the questions and
+# kept warm, so not even a driver install pauses for a password. Press Enter
+# through everything for the conservative answer.
+#
+# The flags below are NOT the interface. They exist so a second box or an
+# unattended run can answer the questions up front:
+#
 #   ./provision-ubuntu-server.sh --only nvidia    # run just these steps
 #   ./provision-ubuntu-server.sh --reinstall      # refresh what is already installed
 #   ./provision-ubuntu-server.sh --docker --nvctk # answer those questions up front
 #   ./provision-ubuntu-server.sh --rootless-accounts scratch   # docker for an
 #                                                 # account, without root
 #
-# Idempotent: safe to re-run. Every question is asked before any work starts, so
-# once you have answered them the run does not stop for input.
+# Values rather than decisions -- which driver branch, how much shm, where docker
+# keeps images -- live in the CONFIGURATION block below. Edit those once for the
+# box; each also has a flag for overriding it on a single run.
+#
+# Idempotent: safe to re-run, and re-running is how you change things later.
 #
 # The nvidia driver is HELD (pinned). Neither apt, nor unattended-upgrades, nor
 # a re-run of this script will move it. It changes only if you ask:
@@ -324,7 +339,7 @@ while (( $# )); do
     --reserve=*)   GROW_RESERVE="${1#*=}"; shift ;;
     --only)        ONLY="${2:?--only needs a comma-separated step list}"; shift 2 ;;
     --only=*)      ONLY="${1#*=}"; shift ;;
-    -h|--help)     sed -n '2,25p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help)     sed -n '2,40p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *) die "unknown argument: $1 (try --help)" ;;
   esac
 done
