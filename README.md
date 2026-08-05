@@ -11,14 +11,14 @@ account like `scratch` provision itself completely.
 ```
 git clone https://github.com/prairie-guy/provision-ubuntu-server.git ~/stuff/provision-ubuntu-server
 cd ~/stuff/provision-ubuntu-server
-./provision-ubuntu-server.sh --check     # dry run first
+./provision-ubuntu-server.sh --dry-run   # see what it would do first
 ./provision-ubuntu-server.sh
 ```
 
 Run it **as yourself**, not `sudo bash` — it calls `sudo` itself, once, and
 keeps the credential warm so a long run never stops for a password.
 
-## Run it with no flags
+## Run it with no arguments
 
 **That is the intended way to use this, and it is what you want in almost every
 case.** With no arguments the script does two things, in order:
@@ -34,28 +34,11 @@ case.** With no arguments the script does two things, in order:
 Answer everything with Enter and you get the conservative choice: it installs
 what is missing and leaves alone what is already there.
 
-Nothing below this point is required reading. **The flags are not the
-interface** — they exist so a *second* box, a cron job, or a re-run can skip the
-questions by answering them up front. Reach for them when you are repeating a
-decision you have already made, not when you are making it.
+Answering everything with Enter gives the conservative choice: it installs what
+is missing and leaves alone what is already there.
 
-The one exception worth knowing: run `--check` first on a box that matters. It
-asks the same questions, then prints what it *would* do instead of doing it.
-
-### Where the settings live
-
-Two tiers, and they answer different kinds of question:
-
-| | holds | how you change it |
-|---|---|---|
-| **the questions** | *what should happen* — install docker or not, hold the driver or not, grow the root volume or not | answer them at the prompt |
-| **the `CONFIGURATION` block** at the top of the script | *what values to use* — which driver branch, how much shm, where docker keeps images, how much VG space to reserve | edit those lines once for the box |
-
-So a value like `NVIDIA_DRIVER_PKG=nvidia-driver-595-open` is not something you
-are asked about on every run — it is a property of this machine, recorded in the
-script with a comment saying why. Change it there and it stays changed. Each of
-those lines also has a matching flag, for the runs where you want to override it
-without editing anything.
+Run `--dry-run` first on a box that matters. It asks the same questions, then
+prints what it *would* do instead of doing it.
 
 Idempotent. Re-running is safe and is how you change things later — see
 [Re-running is safe](#re-running-is-safe-and-is-how-you-change-things).
@@ -76,8 +59,8 @@ Idempotent. Re-running is safe and is how you change things later — see
 ```
 
 For an account that needs **docker without root** — an agent, or any untrusted
-worker — add `--rootless-accounts scratch` at step 4 (or re-run later with
-`--only rootless`) and `--docker-rootless` at step 10. See
+worker — name it at the rootless prompt in step 4 (it lists candidate accounts),
+and answer yes to the rootless docker question in step 10. See
 [Docker for an ordinary account](#docker-for-an-ordinary-account-rootless).
 
 ## Steps
@@ -87,7 +70,7 @@ worker — add `--rootless-accounts scratch` at step 4 (or re-run later with
 | `hostname` | set the system hostname (+ `/etc/hosts`) | asks, defaults to current |
 | `lvm` | grow the root LV into unallocated VG space | asks, **no** |
 | `apt` | update + upgrade | asks if anything is upgradable, **yes** |
-| `packages` | 25 system packages | always |
+| `packages` | 26 system packages | always |
 | `tailscale` | its own apt repo, then `tailscale up` | always; login asks |
 | `mosh` | install + ensure a UTF-8 locale exists | always |
 | `nvidia` | driver + nvtop, then hold against apt | asks |
@@ -96,34 +79,41 @@ worker — add `--rootless-accounts scratch` at step 4 (or re-run later with
 | `rootless` | the root-only prerequisites so named accounts can run docker *without* the docker group | asks when docker is present |
 | `gpustate` | systemd unit for GPU persistence mode | asks, **yes** |
 
-`--only lvm,apt` runs a subset. Unknown step names are rejected rather than
-silently doing nothing.
+Every step is always reached; what it *does* is decided by the question it
+asked. There is no flag for running a subset — a partial provision is how you
+get a box that looks finished and is not.
 
-## Options
+## The three commands
 
-You do not need these for a normal run — the questions cover every decision.
-They are for answering a question up front (so an unattended or repeat run does
-not need you there), for overriding a `CONFIGURATION` value for one run, or for
-narrowing the run to one step.
+```bash
+./provision-ubuntu-server.sh             # ask, then do it
+./provision-ubuntu-server.sh --dry-run   # ask, then print what it would do
+./provision-ubuntu-server.sh doctor      # check this box, offer fixes
+./provision-ubuntu-server.sh --help      # live state + everything below, from the script
+```
 
-| flag | purpose |
-|---|---|
-| `--hostname NAME` | set the hostname; skips the prompt |
-| `--check` | dry run, change nothing |
-| `--only a,b` | run just these steps |
-| `--reinstall` | answer yes to every already-present component |
-| `--docker`, `--nvctk` | answer those questions up front |
-| `--gpu-cap W` | per-GPU power cap for the systemd unit |
-| `--data-root PATH` | where docker keeps images |
-| `--docker-user NAME` | who gets added to the `docker` group (root-equivalent — a human admin) |
-| `--rootless-accounts "a b"` | who gets the root-only half of rootless docker instead (an agent, or any untrusted worker) |
-| `--reserve SIZE` | leave this much of the VG unallocated for snapshots (default 100G) |
-| `--reboot` | reboot when finished, if the driver needs it |
+That is the entire interface. There are no other options, deliberately:
+**anything consequential enough to want a flag is consequential enough to be
+asked about.** The flags this script used to have — `--only`, `--reinstall`,
+`--data-root`, `--gpu-cap` and the rest — were each a way to do something
+irreversible without being asked, and are gone.
 
-Every flag also has an environment-variable form (`NVIDIA_DRIVER_PKG`,
-`DOCKER_SHM_SIZE`, `GROW_RESERVE`, …) — see the CONFIGURATION block at the top
-of the script. Editing that block changes the default permanently for this box;
-setting the variable on the command line changes it for one run.
+An unknown argument tells you where the decision it was trying to make actually
+lives, rather than just failing.
+
+### Where the settings live
+
+Two tiers, answering different kinds of question:
+
+| | holds | how you change it |
+|---|---|---|
+| **the questions** | *what should happen* — install docker or not, switch driver branch or not, grow the root volume or not | answer them at the prompt |
+| **the `CONFIGURATION` block** at the top of the script | *what values to use* — `NVIDIA_DRIVER_PKG`, `DOCKER_DATA_ROOT`, `DOCKER_SHM_SIZE`, `GPU_POWER_CAP`, `GROW_RESERVE`, `MEMLOCK_ACCOUNTS`, `SYSTEM_PACKAGES` | edit those lines once for the box |
+
+A value is a property of this machine, recorded in the file with a comment
+saying why it is what it is — not something to re-answer on every run.
+`./provision-ubuntu-server.sh --help` prints all of them with their current
+settings.
 
 ## Re-running is safe, and is how you change things
 
@@ -141,14 +131,13 @@ correctly.
 
 These rules hold in every step, and are what make a re-run boring:
 
-* **`--check` changes nothing, and is honest.** Every mutation goes through a
+* **`--dry-run` changes nothing, and is honest.** Every mutation goes through a
   `run` wrapper, so a dry run prints the exact command it would have executed,
   prefixed `[would run]`. Anything that cannot go through that wrapper gets an
   explicit dry-run branch. Start here, always — and you can narrow it:
 
   ```bash
-  ./provision-ubuntu-server.sh --check                # the whole box
-  ./provision-ubuntu-server.sh --check --only nvidia  # one step
+  ./provision-ubuntu-server.sh --dry-run
   ```
 
 * **Files are compared before they are written.** Config files are generated in
@@ -169,9 +158,8 @@ These rules hold in every step, and are what make a re-run boring:
   destructive operations it *could* do, it refuses and prints instructions for
   instead (see the data-root case below).
 
-* **Typos are rejected, not ignored.** An unknown `--only` step or an unknown
-  flag is a hard error. A mistyped step name that silently ran nothing and
-  exited 0 would look exactly like success.
+* **Typos are rejected, not ignored.** An unknown argument is a hard error that
+  explains where the decision it was trying to make actually lives.
 
 ### What a re-run will never do on its own
 
@@ -180,13 +168,13 @@ now, on a box that is serving models.
 
 | it will never | what a plain re-run actually does | to do it deliberately |
 |---|---|---|
-| move the nvidia driver | reports `installed and loaded, 4 GPU(s)` and moves on | `--only nvidia --reinstall`, or `NVIDIA_DRIVER_PKG=…` |
-| unhold the nvidia packages | reports `already held (15 packages)` | same as above — the unhold is part of a deliberate change |
-| migrate docker's image store | adopts the existing `data-root` and keeps it | stop docker, `rsync -aHAX`, then `--data-root` (the script prints the recipe) |
+| move the nvidia driver | reports `installed and loaded, 4 GPU(s)` and moves on | type a branch number at the driver question |
+| unhold the nvidia packages | reports `already held (15 packages)` | happens only as part of a driver change you asked for |
+| migrate docker's image store | adopts the existing `data-root` and keeps it | stop docker, `rsync -aHAX`, set `DOCKER_DATA_ROOT` (the script prints the recipe) |
 | restart docker under running containers | warns and leaves it to you | `sudo systemctl restart docker` when convenient |
 | overwrite a config file | backs up first, or skips if identical | — |
-| put an account in the `docker` group | only ever `--docker-user`, and only that one account | `--docker-user NAME` |
-| reboot | tells you one is needed | `--reboot`, which still refuses if dkms has not built the module |
+| put an account in the `docker` group | only ever `DOCKER_GROUP_USER`, and only that one account | set it in the `CONFIGURATION` block |
+| reboot | tells you one is needed | `sudo reboot` — check `dkms status` first |
 
 ### The nvidia driver is pinned
 
@@ -195,27 +183,32 @@ pin is enforced three ways over: `apt upgrade` skips held packages,
 `unattended-upgrades` skips them at 3am, and re-running this script does not
 touch them either.
 
-So the driver moves only when you say so, by one of exactly two commands:
+So the driver moves only when you say so, and you say so at the driver question,
+which every run shows:
 
-```bash
-# stay on this branch, take a newer point release when Ubuntu ships one
-./provision-ubuntu-server.sh --only nvidia --reinstall
-
-# change branch — newer, or older
-NVIDIA_DRIVER_PKG=nvidia-driver-610-open ./provision-ubuntu-server.sh --only nvidia
-NVIDIA_DRIVER_PKG=nvidia-driver-590-open ./provision-ubuntu-server.sh --only nvidia
+```
+==> nvidia driver
+      installed:  nvidia-driver-595-open 595.84 HELD, 15 packages
+      loaded:     595.84                       4 GPU(s)
+      branches:   515 520 525 530 535 550 570 575 580 590 595 610 (-open)
+      available:  nothing newer on this branch
+      a change needs a REBOOT before the new module loads.
+keep 595, or type a branch number to switch to [595]:
 ```
 
-Both unhold, install, and re-hold in one run, so the box is never left unheld.
-Branches available in the configured repos: **570, 575, 580, 590, 595, 610**,
-each in `-open` and proprietary form. Blackwell needs `-open`; the proprietary
-modules do not support these cards.
+Enter keeps what you have. Type `610` and it unholds, installs, and re-holds in
+one run, so the box is never left unheld. Type `590` to go backwards — the
+branch the rtx6kpro wiki validated. Blackwell needs `-open`; the proprietary
+modules do not support these cards, so the `-open` variant is implied.
+
+If a newer point release exists on your current branch, it says so and offers
+it. If not, it says `nothing newer on this branch` and asks nothing.
 
 A driver change needs a **reboot** before the new module is loaded. Until then
 `nvidia-smi` reports a version mismatch and containers cannot see the GPUs, so
 do it in a window where that is acceptable — not while a model is serving. The
-script will not reboot unless you pass `--reboot`, and refuses even then if dkms
-has not built the module for the running kernel.
+script never reboots on its own — it tells you one is needed, and `doctor`
+checks that dkms actually built the module for the running kernel before you do.
 
 What it does *not* currently support is pinning an exact point release within a
 branch (`=595.84-0ubuntu0.24.04.1`). It has not mattered: apt takes the branch's
@@ -223,29 +216,55 @@ candidate, and the hold already freezes you wherever you are.
 
 ### Recipes
 
-**The plain interactive run handles most of these** — re-run with no flags and
-answer the question about the thing you want to change. The commands below are
-the unattended equivalents: use them when you already know the answer, or when
-you want to touch exactly one step and nothing else.
+Everything is either a question you answer during a normal run, or a value you
+edit once. There is no third way.
 
-| to change | do this | what a later plain re-run does |
-|---|---|---|
-| driver branch | `NVIDIA_DRIVER_PKG=nvidia-driver-610-open … --only nvidia` | keeps 610, held; does not revert |
-| driver point release | `--only nvidia --reinstall` | keeps it, held |
-| hostname | `--hostname NAME --only hostname` | leaves it alone |
-| grow `/` into free VG space | `--only lvm` and answer yes | offers again if space remains; declining is free |
-| add a system package | add a line to `SYSTEM_PACKAGES`, re-run | installs only what is missing |
-| upgrade docker itself | `--only docker --reinstall` | keeps it, does not upgrade |
-| docker image store | `--data-root /srv/docker --only docker` | adopts whatever is configured |
-| container shm / log rotation | edit `DOCKER_SHM_SIZE`, re-run `--only docker` | rewrites `daemon.json` only if it differs |
-| GPU power cap | `--gpu-cap 500 --only gpustate` | keeps the unit as-is |
-| docker for a new account | `--rootless-accounts NAME --only rootless` | reports already-present |
-| raise memlock for an account | `--memlock-accounts "a b" --only limits` | rewrites only if the list changed |
-| re-login to tailscale | `--only tailscale` and answer yes | skips, reports the tailnet IP |
+| to change | how |
+|---|---|
+| driver branch, or a point release | type it at the driver question |
+| hostname | answer the hostname prompt |
+| grow `/` into free VG space | answer yes to the lvm question |
+| add a system package | add a line to `SYSTEM_PACKAGES`, re-run |
+| upgrade docker or the toolkit | answer yes when it says a newer version is available |
+| docker image store | set `DOCKER_DATA_ROOT`, re-run |
+| container shm / log rotation | set `DOCKER_SHM_SIZE`, re-run |
+| GPU power cap | set `GPU_POWER_CAP`, re-run |
+| docker for a new account, without root | name it at the rootless prompt |
+| raise memlock for an account | set `MEMLOCK_ACCOUNTS`, re-run |
+| re-login to tailscale | answer yes to the tailscale question |
 
-`--reinstall` answers "yes, update" to *every* already-present component at once.
-It is the blunt instrument: on this box it would also update docker and the
-container toolkit. Prefer `--only STEP --reinstall` when you mean one thing.
+A re-run after any of these is safe: the value is compared against what is on
+the box, and only a real difference causes a change.
+
+## doctor
+
+```bash
+./provision-ubuntu-server.sh doctor
+```
+
+Checks the box and offers each fix one at a time. It is read-only until you
+accept something: every check runs and the whole report prints first, so you see
+the picture before deciding anything. A problem it *cannot* fix from here is
+still reported, with the command that would.
+
+```
+OK    nvidia 595.84 held (15 packages) -- apt cannot move it
+OK    driver 595.84 loaded, 4 GPU(s) visible
+OK    dkms has built the module for 6.8.0-136-generic
+OK    docker 29.7.1, data-root /var/lib/docker
+OK    docker log rotation configured
+WARN  in the docker group, which is ROOT-EQUIVALENT: cdaniels
+WARN  not inspected, home not readable as cdaniels: scratch
+```
+
+It checks the things that fail silently: the driver held or not, the module
+loaded, dkms built for the *running* kernel, docker log rotation, and for each
+rootless account its subuid range, linger, group membership and own
+`daemon.json`. Home directories are `0750`, so when it cannot read one it says
+so — finding nothing in an unreadable home is not the same as finding nothing
+wrong.
+
+Exit status is 1 if anything FAILed, so it is usable from a cron job.
 
 ## The nvidia driver is held on purpose
 
@@ -278,7 +297,7 @@ releases are `docker pull`, not `apt`.
 Move the driver only when a container needs more than that ceiling:
 
 ```
-NVIDIA_DRIVER_PKG=nvidia-driver-610-open ./provision-ubuntu-server.sh --only nvidia
+# or set NVIDIA_DRIVER_PKG in the CONFIGURATION block to make it the default
 sudo reboot
 ```
 
@@ -328,7 +347,7 @@ gains nothing — and a root-owned image store inside a home is destroyed by
 it only when there is a genuinely separate filesystem:
 
 ```
-./provision-ubuntu-server.sh --only docker --data-root /srv/docker
+# set DOCKER_DATA_ROOT in the CONFIGURATION block, then re-run
 ```
 
 Changing it after images exist is **detected and refused**, not migrated — an
@@ -344,8 +363,8 @@ access is a separate, per-account decision with exactly two answers:
 
 | | grants | suitable for |
 |---|---|---|
-| `--docker-user NAME` → `usermod -aG docker` | **root-equivalent** | a human admin |
-| `--rootless-accounts "NAME"` | containers only, as that account | an agent, or any untrusted worker |
+| `DOCKER_GROUP_USER` → `usermod -aG docker` | **root-equivalent** | a human admin |
+| naming it at the rootless prompt | containers only, as that account | an agent, or any untrusted worker |
 
 The group is root-equivalent because a member can run
 
@@ -381,9 +400,9 @@ Everything after that belongs to the account and needs no root:
 
 ```bash
 sudo adduser scratch
-./provision-ubuntu-server.sh --docker --rootless-accounts scratch
+./provision-ubuntu-server.sh          # say yes to docker; name scratch at the rootless prompt
 sudo su - scratch
-./provision-ubuntu-account.sh --docker-rootless
+./provision-ubuntu-account.sh         # say yes to the rootless docker question
 ```
 
 which gives that account its own daemon, its own image store in
@@ -430,7 +449,7 @@ power — but that is a `gpu_burn` compute benchmark, and LLM decode is
 memory-bound, so the real trade is only knowable by sweeping your own workload.
 
 ```
-GPU_POWER_CAP=350 ./provision-ubuntu-server.sh --only gpustate    # persistent
+GPU_POWER_CAP=350 ./provision-ubuntu-server.sh                   # persistent
 gpu-power 350                                                     # live, from the account repo
 ```
 
@@ -456,7 +475,7 @@ everything, OS included.**
 The alternative is a separate filesystem at e.g. `/srv/docker`, leaving `/` on
 the original NVMe. Model weights and images are re-downloadable, so a failure
 there costs a re-download rather than a rebuild. That is also what gives
-`--data-root` a real job.
+`DOCKER_DATA_ROOT` a real job.
 
 ## Deliberately out of scope
 

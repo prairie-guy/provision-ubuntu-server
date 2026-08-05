@@ -48,7 +48,7 @@ set -euo pipefail
 # much is written while a snapshot exists, not on how large the disk is. A
 # percentage under-reserves on a small disk and wastes terabytes on a large one.
 # Accepts a numfmt suffix (100G, 512M) or plain bytes. 0 takes everything.
-GROW_RESERVE="${GROW_RESERVE:-100G}"            # --reserve
+GROW_RESERVE="${GROW_RESERVE:-100G}"            # left unallocated in the VG
 GROW_MIN_BYTES=$((1024*1024*1024))              # below this, not worth resizing
 
 # --- system packages --------------------------------------------------------
@@ -81,13 +81,13 @@ SYSTEM_PACKAGES=(
 # Prompted for, defaulting to the current hostname. Set BEFORE the tailscale
 # step: tailscale takes its device name from the hostname at registration, so
 # renaming afterwards means the tailnet keeps showing the old name.
-SYSTEM_HOSTNAME="${SYSTEM_HOSTNAME:-}"          # --hostname
+SYSTEM_HOSTNAME="${SYSTEM_HOSTNAME:-}"          # empty = you are asked
 
 # Accounts that run GPU containers via ROOTLESS docker. A rootless daemon runs
 # as the account and so cannot raise the account's own memlock hard limit --
 # it has to be raised here, at the system level, or CUDA pinned-memory and NCCL
 # allocations fail inside its containers. Empty = install nothing.
-MEMLOCK_ACCOUNTS="${MEMLOCK_ACCOUNTS:-}"        # --memlock-accounts "a b"
+MEMLOCK_ACCOUNTS="${MEMLOCK_ACCOUNTS:-}"        # "a b" -- empty = none
 
 # Accounts that will run `provision-ubuntu-account.sh --docker-rootless`.
 # That script runs AS the account and never calls sudo -- that contract is what
@@ -105,14 +105,14 @@ MEMLOCK_ACCOUNTS="${MEMLOCK_ACCOUNTS:-}"        # --memlock-accounts "a b"
 #                                          writable /var/run/docker.sock)
 #
 # Empty = prompted for when docker is present, then skipped if left blank.
-ROOTLESS_ACCOUNTS="${ROOTLESS_ACCOUNTS:-}"      # --rootless-accounts "a b"
+ROOTLESS_ACCOUNTS="${ROOTLESS_ACCOUNTS:-}"      # "a b" -- empty = you are asked
 
 # --- gpu --------------------------------------------------------------------
 # `ubuntu-drivers devices` reports this as `recommended` for these exact cards,
 # and it is NEWER than the 590.48 the rtx6kpro community wiki validated. 610 is
 # available in the same repo but is a New Feature Branch, unvalidated on this
 # hardware. Move only when a container needs CUDA above this driver's ceiling:
-#   NVIDIA_DRIVER_PKG=nvidia-driver-610-open ./provision-ubuntu-server.sh --only nvidia
+# or just type the branch number at the driver question.
 # Blackwell requires the -open kernel modules; the proprietary ones do not
 # support these cards.
 NVIDIA_DRIVER_PKG="${NVIDIA_DRIVER_PKG:-nvidia-driver-595-open}"
@@ -124,9 +124,9 @@ NVIDIA_EXTRA_PKGS=(nvtop)
 # The rtx6kpro power sweep puts peak efficiency near 350W (~64% of 600W
 # throughput at half the power) -- but that is a gpu_burn compute benchmark,
 # and LLM decode is memory-bound, so the real trade is only knowable by
-# sweeping your own workload. To try it: set this, then --only gpustate.
+# sweeping your own workload. To try it: set this, then re-run.
 # For a LIVE, non-persistent change use `gpu-power` from the account repo.
-GPU_POWER_CAP="${GPU_POWER_CAP:-}"              # --gpu-cap WATTS
+GPU_POWER_CAP="${GPU_POWER_CAP:-}"              # watts, empty = stock 600W
 GPU_STATE_UNIT="gpu-state"
 
 # --- docker -----------------------------------------------------------------
@@ -143,7 +143,7 @@ NVCTK_PACKAGES=(nvidia-container-toolkit)
 # filesystem and gains nothing. Set an absolute path ONLY when there is a
 # genuinely different, larger filesystem -- e.g. a second NVMe at /srv/docker.
 # Changing it after images exist is detected and refused, not migrated.
-DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-}"        # --data-root PATH
+DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-}"        # empty = /var/lib/docker
 
 # Shared memory and locked-memory defaults for every container. Multi-GPU NCCL
 # hangs or dies with cryptic OOMs when these are left at docker's defaults, and
@@ -153,7 +153,7 @@ DOCKER_SHM_SIZE="${DOCKER_SHM_SIZE:-16G}"
 
 # Account added to the `docker` group. Membership is root-equivalent -- you can
 # bind-mount / into a container -- so this is the invoking human, not everyone.
-DOCKER_GROUP_USER="${DOCKER_GROUP_USER:-${SUDO_USER:-$(id -un)}}"   # --docker-user
+DOCKER_GROUP_USER="${DOCKER_GROUP_USER:-${SUDO_USER:-$(id -un)}}"   # ROOT-EQUIVALENT
 
 # ============================================================================
 
@@ -342,8 +342,8 @@ while (( $# )); do
   esac
 done
 
-# A step runs unless --only was given and does not name it. Unknown names are
-# rejected: a typo would otherwise run nothing and exit 0, looking successful.
+# The steps, in the order they run. Used by --help to describe what a run would
+# ask about; every one of them is always reached.
 VALID_STEPS=(hostname limits lvm apt packages tailscale mosh nvidia docker nvctk rootless gpustate)
 # No --only any more: every step is reached, and what it DOES is decided by the
 # question it asked. Kept as a function so the step guards read unchanged.
@@ -359,7 +359,7 @@ want() { [[ -z "$ONLY" ]] || [[ ",$ONLY," == *",$1,"* ]]; }
 # run before anything has been changed, not after ten minutes of apt.
 for _a in $ROOTLESS_ACCOUNTS; do
   [[ "$_a" =~ ^[a-z_][a-z0-9_-]*$ ]] \
-    || die "invalid --rootless-accounts entry '$_a': not a valid account name"
+    || die "invalid ROOTLESS_ACCOUNTS entry '$_a': not a valid account name"
   getent passwd "$_a" >/dev/null || die "no such account: $_a
    Create it first:  sudo adduser $_a"
 done
@@ -367,9 +367,9 @@ done
 # GPU_POWER_CAP lands in a sed replacement and in an ExecStart line; a stray | or
 # a non-numeric value would corrupt the unit or fail at every boot.
 [[ -z "$GPU_POWER_CAP" || "$GPU_POWER_CAP" =~ ^[0-9]+$ ]] \
-  || die "invalid --gpu-cap '$GPU_POWER_CAP': watts must be a whole number"
+  || die "invalid GPU_POWER_CAP '$GPU_POWER_CAP': watts must be a whole number"
 GROW_RESERVE_B="$(numfmt --from=iec "$GROW_RESERVE" 2>/dev/null)" \
-  || die "invalid --reserve '$GROW_RESERVE': use bytes or an IEC size like 100G"
+  || die "invalid GROW_RESERVE '$GROW_RESERVE': use bytes or an IEC size like 100G"
 
 [[ "$(uname -s)" == "Linux" ]] || die "this script targets Linux"
 command -v apt-get >/dev/null || die "apt-get not found; this script targets Ubuntu/Debian"
@@ -384,7 +384,7 @@ if [[ $EUID -eq 0 ]]; then
   # Without SUDO_USER, DOCKER_GROUP_USER defaulted to `root`, and adding root to
   # the docker group is meaningless. Require an explicit target instead.
   [[ "$DOCKER_GROUP_USER" != root ]] \
-    || die "running as root with no SUDO_USER: pass --docker-user NAME so the
+    || die "running as root with no SUDO_USER: set DOCKER_GROUP_USER so the
    docker group addition has a target other than root"
 else
   command -v sudo >/dev/null || die "sudo not found and not running as root"
@@ -406,7 +406,7 @@ fi
 if [[ -n "$SUDO" ]] && (( ! HELP && ! DOCTOR )); then
   if (( CHECK_ONLY )); then
     # Do not prompt during a dry run; degrade gracefully instead.
-    sudo -n true 2>/dev/null || warn "--check has no cached sudo: LVM state cannot be read, that step will report unknown"
+    sudo -n true 2>/dev/null || warn "--dry-run has no cached sudo: LVM state cannot be read, that step will report unknown"
   else
     log "root is needed for the system changes below; sudo is asked for once"
     sudo -v
@@ -851,7 +851,6 @@ fi
 # One question per component, phrased by what is actually there: "install X?"
 # when absent, "update X?" when present. Asked here, before any work, so a long
 # run never stops for input. A flag already given is taken as the answer.
-# --reinstall answers yes to every component that is present.
 
 if want hostname && (( ! HOSTNAME_EXPLICIT )) && [[ -t 0 ]]; then
   read -r -p "hostname [$SYSTEM_HOSTNAME]: " _reply || true
@@ -1022,10 +1021,11 @@ if want rootless && [[ -n "$ROOTLESS_ACCOUNTS" ]]; then
   # account would end up rootless AND root-equivalent.
   for _a in $ROOTLESS_ACCOUNTS; do
     want docker && (( DO_DOCKER )) && [[ "$_a" == "$DOCKER_GROUP_USER" ]] \
-      && die "$_a is both --docker-user (added to the root-equivalent docker
-   group) and --rootless-accounts (which exists to keep it out). Pick one:
-     --docker-user NAME       for a human admin
-     --rootless-accounts NAME for an agent or untrusted worker"
+      && die "$_a is named as both DOCKER_GROUP_USER (added to the root-equivalent
+   docker group) and a rootless account (which exists to keep it out of that
+   group). Pick one, in the CONFIGURATION block:
+     DOCKER_GROUP_USER   a human admin
+     rootless            an agent, or any untrusted worker"
   done
   if [[ -n "$_in_group" ]]; then
     warn "in the docker group, which is ROOT-EQUIVALENT --$_in_group"
@@ -1092,7 +1092,7 @@ if want limits && [[ -n "$MEMLOCK_ACCOUNTS" ]]; then
     run $SUDO install -D -m 0644 -o root -g root "$_lim" /etc/security/limits.d/90-memlock.conf
   fi
 elif want limits; then
-  skip "no --memlock-accounts given; not touching /etc/security/limits.d"
+  skip "MEMLOCK_ACCOUNTS is empty; not touching /etc/security/limits.d"
 fi
 
 # ------------------------------------------------------------------- 3. lvm --
@@ -1195,7 +1195,7 @@ if want nvidia; then
     # box in exactly the state the hold exists to prevent.
     #
     # Gated on the change being DELIBERATE: either you asked to reinstall/update
-    # (--reinstall, or answering yes to the question above), or the driver you
+    # (you typed a branch, or said yes to a point release), or the driver you
     # asked for is genuinely not installed (a fresh box, or NVIDIA_DRIVER_PKG
     # naming a different branch). Merely reaching this step must never unhold --
     # that turns any routine run into an unattended driver upgrade.
@@ -1250,7 +1250,7 @@ if want docker && (( DO_DOCKER )); then
   # Refuse to plant a root-owned image store inside somebody's home directory:
   # `deluser --remove-home` would then take every image with it.
   if [[ -n "$DOCKER_DATA_ROOT" ]]; then
-    [[ "$DOCKER_DATA_ROOT" == /* ]] || die "--data-root must be an absolute path"
+    [[ "$DOCKER_DATA_ROOT" == /* ]] || die "DOCKER_DATA_ROOT must be an absolute path"
     while IFS=: read -r _u _x _uid _g _c _home _s; do
       (( _uid >= 1000 )) && [[ -n "$_home" && "$_home" != "/" ]] \
         && [[ "$DOCKER_DATA_ROOT" == "$_home" || "$DOCKER_DATA_ROOT" == "$_home"/* ]] \
@@ -1272,7 +1272,7 @@ if want docker && (( DO_DOCKER )); then
   # to be changed.
   if [[ -z "$DOCKER_DATA_ROOT" && -n "$_current_root" && "$_current_root" != "/var/lib/docker" ]]; then
     warn "docker already uses data-root=$_current_root; keeping it."
-    warn "pass --data-root to change it deliberately."
+    warn "set DOCKER_DATA_ROOT to change it deliberately."
     DOCKER_DATA_ROOT="$_current_root"
   fi
   if [[ -n "$DOCKER_DATA_ROOT" && -n "$_current_root" \
@@ -1337,7 +1337,7 @@ fi
 # ------------------------------------------------------------------ 8. nvctk --
 
 if want nvctk && (( DO_NVCTK )); then
-  have_docker || (( CHECK_ONLY )) || die "the container toolkit needs docker; add --docker"
+  have_docker || (( CHECK_ONLY )) || die "the container toolkit needs docker; answer yes to the docker question"
   # NOTE the single quotes: $(ARCH) is apt's OWN substitution, evaluated when
   # apt reads the file. Let bash expand it and you get an empty path and a 404.
   add_apt_repo nvidia-container-toolkit \
@@ -1380,7 +1380,7 @@ if want rootless && [[ -n "$ROOTLESS_ACCOUNTS" ]]; then
     warn "rootless needs ${_rl_missing[*]}, which this run has not installed."
     warn "  uidmap comes from the packages step, docker-ce-rootless-extras from"
     warn "  the docker step. Re-run including them:"
-    warn "      ./provision-ubuntu-server.sh --docker --rootless-accounts \"$ROOTLESS_ACCOUNTS\""
+    warn "      ./provision-ubuntu-server.sh    # and say yes to docker"
   fi
 
   for _a in $ROOTLESS_ACCOUNTS; do
