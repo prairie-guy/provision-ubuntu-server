@@ -650,14 +650,16 @@ fi
 # that would fix it. Staying silent about a finding because there is no button
 # for it is worse than showing it.
 DOC_OK=0; DOC_WARN=0; DOC_FAIL=0
-DOC_FIX_DESC=(); DOC_FIX_CMD=()
 doc_ok()   { printf '  \033[1;32mOK\033[0m    %s\n' "$*"; DOC_OK=$((DOC_OK+1)); }
 doc_warn() { printf '  \033[1;33mWARN\033[0m  %s\n' "$*"; DOC_WARN=$((DOC_WARN+1)); }
 doc_fail() { printf '  \033[1;31mFAIL\033[0m  %s\n' "$*"; DOC_FAIL=$((DOC_FAIL+1)); }
 doc_note() { printf '        \033[2m%s\033[0m\n' "$*"; }
 # Queue a fix for the end. An EMPTY description means "reportable, not fixable
 # from here" -- the command is printed for you to run yourself.
-doc_fix()  { DOC_FIX_DESC+=("$1"); DOC_FIX_CMD+=("$2"); }
+# Print the fix under the finding it belongs to. doctor REPORTS; it does not
+# act. Offering each fix interactively meant three different problems showing
+# the same "re-run the script" command with vague labels -- noise, not help.
+doc_fix()  { local c="${2:-$1}"; [[ -n "$c" ]] && printf '        \033[2mfix: %s\033[0m\n' "$c"; return 0; }
 
 if (( DOCTOR )); then
   printf '\n'
@@ -671,7 +673,7 @@ if (( DOCTOR )); then
     doc_ok "apt package lists are ${_age}d old"
   else
     doc_warn "apt package lists are ${_age}d old -- 'available' versions may be stale"
-    doc_fix "refresh apt package lists" "$SUDO apt-get update"
+    doc_fix "sudo apt-get update"
   fi
 
   # --- nvidia: the driver moving unnoticed is the failure this box cares most
@@ -684,7 +686,7 @@ if (( DOCTOR )); then
       doc_fail "nvidia packages are NOT held"
       doc_note "unattended-upgrades can move libnvidia-* under the loaded module,"
       doc_note "detaching the GPUs from every running container"
-      doc_fix "hold the nvidia packages" "$SCRIPT_DIR/provision-ubuntu-server.sh"
+      doc_fix "re-run; it re-holds them"
     fi
     if gpu_ready; then
       doc_ok "driver $(nvidia_running_version) loaded, $(nvidia-smi -L 2>/dev/null | wc -l) GPU(s) visible"
@@ -714,7 +716,7 @@ if (( DOCTOR )); then
       doc_ok "$GPU_STATE_UNIT.service enabled"
     else
       doc_fail "$GPU_STATE_UNIT.service is installed but not enabled"
-      doc_fix "enable $GPU_STATE_UNIT.service" "$SUDO systemctl enable --now $GPU_STATE_UNIT.service"
+      doc_fix "sudo systemctl enable --now $GPU_STATE_UNIT.service"
     fi
     if gpu_ready; then
       _pm="$(nvidia-smi --query-gpu=persistence_mode --format=csv,noheader 2>/dev/null | sort -u | tr '\n' ' ')"
@@ -726,7 +728,7 @@ if (( DOCTOR )); then
     fi
   elif gpu_ready; then
     doc_warn "no $GPU_STATE_UNIT.service -- persistence mode is not set at boot"
-    doc_fix "install the GPU state unit" "$SCRIPT_DIR/provision-ubuntu-server.sh"
+    doc_fix "re-run and answer yes to the GPU persistence question"
   fi
 
   # --- docker: unbounded logs fill / on a box running a long-lived server, and
@@ -739,7 +741,7 @@ if (( DOCTOR )); then
     else
       doc_fail "docker has NO log rotation -- the json-file driver is unbounded"
       doc_note "a long-running container writing progress lines will fill /"
-      doc_fix "write /etc/docker/daemon.json" "$SCRIPT_DIR/provision-ubuntu-server.sh"
+      doc_fix "re-run and answer yes to the docker question"
     fi
     if pkg_upgradable docker-ce; then
       doc_note "note: docker-ce $(pkg_candidate_ver docker-ce) is available"
@@ -770,19 +772,18 @@ if (( DOCTOR )); then
     else
       doc_fail "$_u has no subuid/subgid range -- its rootless daemon cannot start"
       _s1="$(next_subid /etc/subuid)"; _s2="$(next_subid /etc/subgid)"
-      doc_fix "add a subordinate id range for $_u" \
-        "$SUDO usermod --add-subuids $_s1-$((_s1+SUBID_COUNT-1)) --add-subgids $_s2-$((_s2+SUBID_COUNT-1)) $_u"
+      doc_fix "sudo usermod --add-subuids $_s1-$((_s1+SUBID_COUNT-1)) --add-subgids $_s2-$((_s2+SUBID_COUNT-1)) $_u"
     fi
     if [[ "$(loginctl show-user "$_u" -p Linger --value 2>/dev/null)" == yes ]]; then
       doc_ok "$_u has linger enabled -- its daemon survives logout"
     else
       doc_fail "$_u has NO linger -- its daemon and containers die at its last logout"
-      doc_fix "enable linger for $_u" "$SUDO loginctl enable-linger $_u"
+      doc_fix "sudo loginctl enable-linger $_u"
     fi
     if in_docker_group "$_u"; then
       doc_fail "$_u is rootless AND in the root-equivalent docker group"
       doc_note "the rootful socket stays reachable, so rootless buys nothing"
-      doc_fix "remove $_u from the docker group" "$SUDO gpasswd -d $_u docker"
+      doc_fix "sudo gpasswd -d $_u docker"
     fi
     if [[ -f "$_home/.config/docker/daemon.json" ]]; then
       doc_ok "$_u has its own daemon.json (log rotation, shm, memlock)"
@@ -804,7 +805,7 @@ if (( DOCTOR )); then
       doc_ok "tailscale up ($(tailscale ip -4 2>/dev/null | head -1))"
     else
       doc_warn "tailscale is installed but not logged in"
-      doc_fix "log in to tailscale" "$SUDO tailscale up"
+      doc_fix "sudo tailscale up"
     fi
   fi
 
@@ -817,21 +818,6 @@ if (( DOCTOR )); then
   log "$DOC_OK ok, $DOC_WARN warning(s), $DOC_FAIL failure(s)"
 
   # Offer each fix individually. Nothing above this point changed anything.
-  if (( ${#DOC_FIX_CMD[@]} )); then
-    printf '\n'
-    for _i in "${!DOC_FIX_CMD[@]}"; do
-      if [[ -z "${DOC_FIX_DESC[$_i]}" ]]; then
-        warn "not fixable from here:  ${DOC_FIX_CMD[$_i]}"
-        continue
-      fi
-      printf '\n  %s\n      \033[2m%s\033[0m\n' "${DOC_FIX_DESC[$_i]}" "${DOC_FIX_CMD[$_i]}"
-      if (( CHECK_ONLY )); then
-        printf '    \033[2m[dry run -- would offer this fix]\033[0m\n'
-      elif ask_yn "  run it?" n; then
-        eval "${DOC_FIX_CMD[$_i]}" || warn "that fix failed; the rest of the report still stands"
-      fi
-    done
-  fi
   printf '\n'
   (( DOC_FAIL )) && exit 1
   exit 0
