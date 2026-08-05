@@ -240,7 +240,12 @@ apt_update() {
   APT_UPDATED=1; APT_STALE=0
 }
 
-have_pkg() { [[ "$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null)" == "install ok installed" ]]; }
+# dpkg's Status is three words: "<desired> ok <state>". HOLDING a package changes
+# the FIRST word to `hold`, so matching the whole string reports every held
+# package as missing. That is not cosmetic: it made a routine run decide the
+# nvidia driver was absent, unhold the whole stack and reinstall it -- the exact
+# unattended upgrade the hold exists to prevent. Match on the state instead.
+have_pkg() { [[ "$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null)" == *" ok installed" ]]; }
 
 # ALWAYS returns 0. Under `set -e` a helper returning 1 to mean "nothing to do"
 # would abort the script at the call site.
@@ -686,7 +691,14 @@ if want nvidia; then
     # A deliberate driver change means unholding first. Remember that we did,
     # so the holds are restored below -- otherwise this path silently leaves the
     # box in exactly the state the hold exists to prevent.
-    if apt-mark showhold 2>/dev/null | grep -qE '^(nvidia-|libnvidia-)'; then
+    #
+    # Gated on the change being DELIBERATE: either you asked to reinstall/update
+    # (--reinstall, or answering yes to the question above), or the driver you
+    # asked for is genuinely not installed (a fresh box, or NVIDIA_DRIVER_PKG
+    # naming a different branch). Merely reaching this step must never unhold --
+    # that turns any routine run into an unattended driver upgrade.
+    if { (( FORCE_NVIDIA )) || ! have_pkg "$NVIDIA_DRIVER_PKG"; } \
+       && apt-mark showhold 2>/dev/null | grep -qE '^(nvidia-|libnvidia-)'; then
       log "unholding nvidia packages for a deliberate change"
       run $SUDO apt-mark unhold $(apt-mark showhold | grep -E '^(nvidia-|libnvidia-)')
       WAS_HELD=1
