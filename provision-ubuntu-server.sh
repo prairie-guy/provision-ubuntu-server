@@ -1143,6 +1143,27 @@ if want lvm; then
   elif (( LVM_FREE_B <= GROW_MIN_BYTES )); then
     skip "$LVM_PATH: $(hb "$LVM_SIZE_B"), nothing unallocated worth growing into"
   else
+    # Ubuntu's installer routinely leaves most of the disk unallocated -- a 3TB
+    # VG with a 100GB root LV is the default, not a mistake someone made. On a
+    # box that will hold container images and model weights that fills fast and
+    # silently, so a LOT of unused space is worth shouting about. A little is
+    # not: this box is 10% unallocated on purpose, for snapshots, and should not
+    # be nagged every run.
+    if (( LVM_FREE_B * 4 > (LVM_SIZE_B + LVM_FREE_B) )); then
+      warn "$LVM_VG is mostly UNALLOCATED: / is $(hb "$LVM_SIZE_B"), $(hb "$LVM_FREE_B") is unused"
+      warn "  that is $(( LVM_FREE_B * 100 / (LVM_SIZE_B + LVM_FREE_B) ))% of the volume group sitting idle -- the Ubuntu"
+      warn "  installer's default, not a decision anyone made. Container images and"
+      warn "  model weights will fill / long before the disk is full."
+      warn "  This script does NOT resize. Grow it yourself, deliberately:"
+      warn "      sudo lvextend -L +SIZE $LVM_PATH"
+      case "$LVM_FSTYPE" in
+        ext2|ext3|ext4) warn "      sudo resize2fs $LVM_PATH        # ext: takes the DEVICE" ;;
+        xfs)            warn "      sudo xfs_growfs /                # xfs: takes the MOUNT POINT" ;;
+      esac
+      warn "  / stays mounted throughout. Leave some unallocated for snapshots."
+      LVM_SHOUTED=1
+    fi
+    if [[ -z "${LVM_SHOUTED:-}" ]]; then
     skip "$LVM_PATH: $(hb "$LVM_SIZE_B") used of $LVM_VG, $(hb "$LVM_FREE_B") unallocated"
     skip "  this script does NOT resize. To grow / yourself, deliberately:"
     skip "      sudo lvextend -L +SIZE $LVM_PATH"
@@ -1151,6 +1172,7 @@ if want lvm; then
       xfs)            skip "      sudo xfs_growfs /                # xfs: takes the MOUNT POINT" ;;
     esac
     skip "  / stays mounted. Leave some unallocated for snapshots."
+    fi
   fi
 fi
 
