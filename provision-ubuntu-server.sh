@@ -2,35 +2,23 @@
 #
 # provision-ubuntu-server.sh -- provision the SYSTEM, not a user account.
 #
-# Everything here needs root and applies to the whole machine. Run it once per
-# box, before provision-ubuntu-account.sh is run for each user. Its main job is
-# to install the system packages both of those need, so no per-account run ever
-# escalates to sudo.
-#
-# THERE ARE THREE COMMANDS. That is the whole interface:
+# Run once per box, before provision-ubuntu-account.sh runs for each user. It
+# installs the system packages both need, so no per-account run needs sudo.
 #
 #   ./provision-ubuntu-server.sh             ask, then do it
 #   ./provision-ubuntu-server.sh --dry-run   ask, then print what it would do
 #   ./provision-ubuntu-server.sh doctor      check this box, offer fixes
 #
-# It asks a plain question about each thing it could do, phrased by what it
-# actually found on the box, and asks ALL of them before doing any work. Then it
-# runs to completion without stopping -- sudo is primed during the questions and
-# kept warm, so not even a driver install pauses for a password. Press Enter
-# through everything for the conservative answer.
+# That is the whole interface. It asks about everything BEFORE doing any work,
+# then runs to completion without stopping. Enter takes the conservative answer.
 #
-# There are no other options, deliberately. Anything consequential enough to
-# want a flag is consequential enough to be asked about, and anything that is a
-# VALUE rather than a decision -- which driver branch, where docker keeps
-# images, the per-GPU power cap -- lives in the CONFIGURATION block below, where
-# it carries a comment saying why it is what it is.
+# Decisions are questions. Values live in the CONFIGURATION block below. There
+# are no flags: anything worth one is worth being asked about.
 #
-# Idempotent: safe to re-run, and re-running is how you change things later.
+# Idempotent -- re-running is safe, and is how you change things later.
 #
-# The nvidia driver is HELD (pinned). Neither apt, nor unattended-upgrades, nor
-# a re-run of this script will move it. It changes only when you say so, at the
-# driver question, which shows what is installed and which branches exist and
-# lets you type a different one. Enter keeps what you have.
+# The nvidia driver is HELD. Nothing moves it -- not apt, not
+# unattended-upgrades, not a re-run -- except you, at the driver question.
 #
 set -euo pipefail
 
@@ -582,7 +570,7 @@ lvm_probe() {
 # flags. In particular it names what has an update waiting, so you never have to
 # start a run to find out whether there is anything to do.
 if (( HELP )); then
-  sed -n '2,34p' "$0" | sed 's/^# \?//'
+  sed -n '2,22p' "$0" | sed 's/^# \?//'
   printf '\033[1mSTATE OF THIS BOX\033[0m\n\n'
   printf '  apt package lists: %sd old\n' "$(apt_meta_age_days)"
 
@@ -600,7 +588,7 @@ if (( HELP )); then
 
   # One line per component that apt can move, so "is there anything to update?"
   # is answered here rather than by starting a run.
-  printf '\n  \033[1mupdates available\033[0m (these are what a run would offer):\n'
+  printf '\n  \033[1mupdates available\033[0m\n'
   _any_upd=0
   for _p in docker-ce nvidia-container-toolkit tailscale mosh; do
     if have_pkg "$_p"; then
@@ -616,9 +604,7 @@ if (( HELP )); then
   fi
   (( _any_upd )) || printf '    nothing -- every managed component is current\n'
 
-  printf '\n\033[1mWHAT A RUN WOULD ASK ABOUT\033[0m\n\n'
-  printf '  One question each, in this order, phrased by what is already there.\n'
-  printf '  Anything already done is reported and skipped, not asked about again.\n\n'
+  printf '\n\033[1mWHAT A RUN WOULD ASK ABOUT\033[0m  (one question each, in order)\n\n'
   printf '    %-12s %s\n' \
     hostname  "the system hostname (asked before tailscale registers a name)" \
     limits    "memlock for named accounts (MEMLOCK_ACCOUNTS)" \
@@ -634,29 +620,23 @@ if (( HELP )); then
     rootless  "docker for named accounts WITHOUT the root-equivalent group" \
     gpustate  "a systemd unit setting GPU persistence mode at boot"
 
-  printf '\n\033[1mWHAT YOU CAN CHANGE, AND WHERE\033[0m\n\n'
-  printf '  There are no options for these. Edit the CONFIGURATION block at the top\n'
-  printf '  of %s -- each carries a comment explaining the\n' "$(basename "$0")"
-  printf '  choice. They are properties of this machine, not per-run decisions.\n\n'
+  printf '\n\033[1mWHAT YOU CAN CHANGE\033[0m  (CONFIGURATION block, top of %s)\n\n' "$(basename "$0")"
   printf '    %-22s %s\n' \
-    "NVIDIA_DRIVER_PKG" "$NVIDIA_DRIVER_PKG   (also choosable at the driver question)" \
+    "NVIDIA_DRIVER_PKG" "$NVIDIA_DRIVER_PKG   (or type a branch at the question)" \
     "DOCKER_DATA_ROOT"  "${DOCKER_DATA_ROOT:-/var/lib/docker (docker default)}" \
     "DOCKER_SHM_SIZE"   "$DOCKER_SHM_SIZE   (NCCL dies at docker's 64M default)" \
     "DOCKER_GROUP_USER" "$DOCKER_GROUP_USER   -- gets ROOT-EQUIVALENT docker access" \
     "GPU_POWER_CAP"     "${GPU_POWER_CAP:-none -- each card at its stock 600W}" \
-    "GROW_RESERVE"      "$GROW_RESERVE   left unallocated in the VG for snapshots" \
+    "GROW_RESERVE"      "$GROW_RESERVE   left unallocated for snapshots" \
     "MEMLOCK_ACCOUNTS"  "${MEMLOCK_ACCOUNTS:-none}" \
-    "ROOTLESS_ACCOUNTS" "${ROOTLESS_ACCOUNTS:-none set -- you are asked at the prompt}" \
-    "SYSTEM_PACKAGES"   "${#SYSTEM_PACKAGES[@]} packages -- adding a line is safe, removing one" \
-    ""                  "  makes some later per-account run need sudo"
+    "ROOTLESS_ACCOUNTS" "${ROOTLESS_ACCOUNTS:-none -- you are asked}" \
+    "SYSTEM_PACKAGES"   "${#SYSTEM_PACKAGES[@]} -- adding is safe; removing makes an account need sudo"
 
   printf '\n\033[1mWHAT IT WILL NOT DO\033[0m\n\n'
-  printf '  move the nvidia driver unless you ask at the driver question\n'
-  printf '  migrate docker'"'"'s image store -- it adopts what is there and says so\n'
-  printf '  restart docker while containers are running -- it warns instead\n'
-  printf '  overwrite a config file without a NAME.bak-<timestamp> copy first\n'
-  printf '  delete anything: this script has no rm outside its own temp directory\n'
-  printf '  reboot on its own -- it tells you when one is needed\n\n'
+  printf '  move the driver unasked  |  migrate docker'"'"'s image store\n'
+  printf '  restart docker under running containers  |  reboot on its own\n'
+  printf '  overwrite a file without a NAME.bak-<timestamp> copy\n'
+  printf '  delete anything -- there is no rm outside its own temp directory\n\n'
   exit 0
 fi
 
