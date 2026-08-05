@@ -5,6 +5,10 @@ Documentation=https://github.com/prairie-guy/provision-ubuntu-server
 # StopWhenUnneeded=true, so enabling it does NOT give you persistence mode.
 # That is why this unit exists rather than a drop-in.
 After=nvidia-persistenced.service
+# Inert on a box with no NVIDIA card. Without this the ExecStartPre loop below
+# waits the full 90s at every boot and then fails the unit -- on a machine that
+# has nothing wrong with it, it just has no GPU.
+ConditionPathExistsGlob=/dev/nvidia[0-9]*
 
 [Service]
 Type=oneshot

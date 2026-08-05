@@ -629,7 +629,7 @@ if (( HELP )); then
   printf '    %-12s %s\n' \
     hostname  "the system hostname (asked before tailscale registers a name)" \
     limits    "memlock for named accounts (MEMLOCK_ACCOUNTS)" \
-    lvm       "grow / into unallocated VG space -- asked, default no" \
+    lvm       "reports free VG space; never resizes anything" \
     apt       "apt update + upgrade, if anything is upgradable" \
     packages  "${#SYSTEM_PACKAGES[@]} system packages both scripts need" \
     tailscale "install + tailscale up (interactive browser login)" \
@@ -894,22 +894,9 @@ fi
 [[ "$SYSTEM_HOSTNAME" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] \
   || die "invalid hostname '$SYSTEM_HOSTNAME': letters, digits and hyphens only, no leading or trailing hyphen"
 
-DO_GROW_LV=0
 FORCE_DOCKER=$FORCE; FORCE_NVCTK=$FORCE; FORCE_GPUSTATE=$FORCE
 FORCE_TAILSCALE=$FORCE; FORCE_NVIDIA=$FORCE
 DO_TS_UP=0; DO_HOLD_NVIDIA=0; DO_UPGRADE=0; DO_DKMS_CHECK=0
-
-if want lvm; then
-  if lvm_probe; then
-    printf '\n'
-    log "/ is $LVM_PATH ($LVM_FSTYPE) in volume group $LVM_VG"
-    printf '      logical volume: %s\n' "$(hb "$LVM_SIZE_B")"
-    printf '      unallocated:    %s\n' "$(hb "$LVM_FREE_B")"
-    printf '      would grow by:  %s   (leaving %s reserved)\n' "$(hb "$LVM_ADD_B")" "$(hb "$GROW_RESERVE_B")"
-    printf '      then:           resize the filesystem online, / stays mounted\n'
-    ask_yn "grow the root volume now?" n && DO_GROW_LV=1
-  fi
-fi
 
 if want apt; then
   _upgradable="$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst' || true)"
@@ -1142,22 +1129,28 @@ fi
 
 # ------------------------------------------------------------------- 3. lvm --
 
+# REPORTS ONLY. This step used to offer to grow / and then run lvextend and
+# resize2fs for you. It no longer touches LVM at all.
+#
+# Growing a root volume is not a thing to offer in the same breath as "install
+# mosh?": it is irreversible without a restore, it is the one operation here
+# that can lose a filesystem, and a box whose disk is already laid out correctly
+# has nothing to gain from being asked every run. So it prints what it sees and
+# the two commands, and you run them deliberately or not at all.
 if want lvm; then
   if (( ! LVM_OK )); then
     skip "$LVM_WHY"
-  elif (( ! DO_GROW_LV )); then
-    skip "leaving $LVM_PATH at its current size"
+  elif (( LVM_FREE_B <= GROW_MIN_BYTES )); then
+    skip "$LVM_PATH: $(hb "$LVM_SIZE_B"), nothing unallocated worth growing into"
   else
-    # Let LVM do the arithmetic with the same %FREE expression that was shown.
-    log "growing $LVM_PATH by $(hb "$LVM_ADD_B"), leaving $(hb "$GROW_RESERVE_B") unallocated"
-    run $SUDO lvextend -L "+${LVM_ADD_B}b" "$LVM_PATH"
-    # resize2fs takes the DEVICE; xfs_growfs takes the MOUNT POINT. Swapping
-    # them is the most common way this goes wrong, so both are written out.
+    skip "$LVM_PATH: $(hb "$LVM_SIZE_B") used of $LVM_VG, $(hb "$LVM_FREE_B") unallocated"
+    skip "  this script does NOT resize. To grow / yourself, deliberately:"
+    skip "      sudo lvextend -L +SIZE $LVM_PATH"
     case "$LVM_FSTYPE" in
-      ext2|ext3|ext4) run $SUDO resize2fs "$LVM_PATH" ;;
-      xfs)            run $SUDO xfs_growfs / ;;
+      ext2|ext3|ext4) skip "      sudo resize2fs $LVM_PATH        # ext: takes the DEVICE" ;;
+      xfs)            skip "      sudo xfs_growfs /                # xfs: takes the MOUNT POINT" ;;
     esac
-    (( CHECK_ONLY )) || log "/ is now $(df -h --output=size / | tail -1 | tr -d ' ')"
+    skip "  / stays mounted. Leave some unallocated for snapshots."
   fi
 fi
 

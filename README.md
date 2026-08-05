@@ -68,7 +68,7 @@ and answer yes to the rootless docker question in step 10. See
 | step | what | default |
 |---|---|---|
 | `hostname` | set the system hostname (+ `/etc/hosts`) | asks, defaults to current |
-| `lvm` | grow the root LV into unallocated VG space | asks, **no** |
+| `lvm` | **reports** free VG space and how to grow / yourself; never resizes | always |
 | `apt` | update + upgrade | asks if anything is upgradable, **yes** |
 | `packages` | 26 system packages | always |
 | `tailscale` | its own apt repo, then `tailscale up` | always; login asks |
@@ -232,7 +232,7 @@ edit once. There is no third way.
 |---|---|
 | driver branch, or a point release | type it at the driver question |
 | hostname | answer the hostname prompt |
-| grow `/` into free VG space | answer yes to the lvm question |
+| grow `/` into free VG space | the script will not do this — it prints the `lvextend` / `resize2fs` commands to run deliberately |
 | add a system package | add a line to `SYSTEM_PACKAGES`, re-run |
 | upgrade docker or the toolkit | answer yes when it says a newer version is available |
 | docker image store | set `DOCKER_DATA_ROOT`, re-run |
